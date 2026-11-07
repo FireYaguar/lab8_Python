@@ -117,7 +117,7 @@ def index_cmd(
     t1 = time.perf_counter()
     save(index, out_path)
     t_save = time.perf_counter() - t1
-    n_postings = sum(len(p) for p in index.postings.values())
+    n_postings = index.num_postings
     log.info(
         "build %.2f s (%s x%d, %d chunks, merge %.2f s), save %.2f s",
         t_build,
@@ -221,12 +221,17 @@ def serve_cmd(
     host: Annotated[str, typer.Option(help="Bind address (0.0.0.0 in a container).")] = "127.0.0.1",
     port: Annotated[int, typer.Option(envvar="PORT", help="Port ($PORT on Render/Fly).")] = 8000,
     workers: Annotated[int, typer.Option(min=1, help="uvicorn worker processes.")] = 1,
+    embeddings: Annotated[
+        Path | None, typer.Option(help="Embeddings for mode=semantic|hybrid ($EMBEDDINGS_PATH).")
+    ] = None,
 ) -> None:
     """Run the web API + UI with uvicorn (http://HOST:PORT/, OpenAPI at /docs)."""
     import uvicorn
 
     if index_path is not None:
         os.environ["INDEX_PATH"] = str(index_path)  # read by Settings in every worker process
+    if embeddings is not None:
+        os.environ["EMBEDDINGS_PATH"] = str(embeddings)
     path = Path(os.environ.get("INDEX_PATH", "index.bin"))
     if not path.is_file():
         fail(f"index file not found: {path} (build it with `findex index`)")
@@ -251,6 +256,39 @@ def serve_cmd(
     )
 
 
+@app.command("embed")
+def embed_cmd(
+    index_path: Annotated[Path, typer.Argument(metavar="INDEX", help="Index file.")],
+    out_path: Annotated[Path, typer.Option("--out", "-o", help="Embeddings file.")] = Path(
+        "embeddings.npz"
+    ),
+    model: Annotated[Path, typer.Option(help="Word vectors (scripts/export_wordvec.py).")] = Path(
+        "models/wordvec.npz"
+    ),
+) -> None:
+    """Chunk every document, embed the chunks, save the matrix for semantic/hybrid search."""
+    from findex.semantic import WordVectors, build_semantic
+    from findex.store import load
+
+    for p in (index_path, model):
+        if not p.is_file():
+            fail(f"file not found: {p}")
+    t0 = time.perf_counter()
+    sem = build_semantic(load(index_path), WordVectors.load(model))
+    sem.save(out_path)
+    out.print(
+        f"{sem.E.shape[0]:,} chunks x {sem.E.shape[1]} dims from "
+        f"{len(set(sem.chunk_doc.tolist())):,} documents -> {out_path} "
+        f"({out_path.stat().st_size / 2**20:.1f} MiB) in {time.perf_counter() - t0:.1f} s"
+    )
+
+
+class ModeName(StrEnum):
+    keyword = "keyword"
+    semantic = "semantic"
+    hybrid = "hybrid"
+
+
 @app.command("search")
 def search_cmd(
     index_path: Annotated[Path, typer.Argument(metavar="INDEX", help="Index file.")],
@@ -258,14 +296,27 @@ def search_cmd(
     k: Annotated[int, typer.Option("--k", "-k", min=1, help="How many results.")] = 10,
     scorer: Annotated[ScorerName, typer.Option(help="Ranking function.")] = ScorerName.bm25,
     as_json: Annotated[bool, typer.Option("--json", help="JSON lines on stdout.")] = False,
+    mode: Annotated[ModeName, typer.Option(help="keyword, semantic or hybrid (RRF).")] = (
+        ModeName.keyword
+    ),
+    embeddings: Annotated[
+        Path, typer.Option(help="Embeddings for semantic/hybrid (`findex embed`).")
+    ] = Path("embeddings.npz"),
 ) -> None:
     """Ranked search with highlighted snippets."""
     if not index_path.is_file():
         fail(f"index file not found: {index_path} (build it with `findex index`)")
+    semantic = None
+    if mode != ModeName.keyword:
+        if not embeddings.is_file():
+            fail(f"embeddings not found: {embeddings} (build them with `findex embed`)")
+        from findex.semantic import SemanticIndex
+
+        semantic = SemanticIndex.load(embeddings)
     try:
         with open_index(index_path) as index:
-            results = search(index, query, scorer.value, k)
-            total = len(match(index, query))
+            results = search(index, query, scorer.value, k, mode=mode.value, semantic=semantic)
+            total = len(match(index, query)) if mode == ModeName.keyword else len(results)
     except QueryError as e:
         fail(f"bad query: {e}", code=2)
     except (pickle.UnpicklingError, json.JSONDecodeError, TypeError, EOFError) as e:

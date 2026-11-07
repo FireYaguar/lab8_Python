@@ -122,3 +122,9 @@ def test_openapi_docs_generated(client: TestClient) -> None:
     schema = client.get("/openapi.json").json()
     assert {"/search", "/docs/{doc_id}", "/stats", "/health"} <= set(schema["paths"])
     assert client.get("/docs").status_code == 200
+
+
+def test_semantic_mode_without_embeddings_is_400(client: TestClient) -> None:
+    r = client.get("/search", params={"q": "python", "mode": "semantic"})
+    assert r.status_code == 400 and "findex embed" in r.json()["detail"]
+    assert client.get("/search", params={"q": "x", "mode": "fuzzy"}).status_code == 422

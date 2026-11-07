@@ -1,0 +1,3 @@
+load index.bin           889.9 ms
+search 3 terms (full)    76.13 ms
+build (serial, pos)       2732 ms

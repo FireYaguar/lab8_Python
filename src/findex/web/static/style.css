@@ -9,6 +9,7 @@ header nav a { color: var(--muted); }
 .search { display: flex; gap: 8px; margin: 28px 0 6px; }
 .search input { flex: 1; padding: 11px 14px; font-size: 17px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
 .search input:focus { outline: 2px solid var(--accent); border-color: transparent; }
+.search select:disabled { display: none; }
 .search select, .search button { padding: 0 14px; border-radius: 8px; border: 1px solid var(--line); background: #fff; font-size: 15px; }
 .search button { background: var(--accent); color: #fff; border: none; cursor: pointer; }
 .hint, .meta, footer { color: var(--muted); font-size: 14px; }

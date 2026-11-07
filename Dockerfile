@@ -13,10 +13,12 @@ RUN uv sync --locked --no-dev --no-install-project
 # 2) the project itself, installed as a package (not editable)
 COPY src ./src
 RUN uv sync --locked --no-dev --no-editable
-# 3) corpus + index baked into the image (simple, fine for a portfolio demo)
+# 3) corpus + index + embeddings baked into the image (simple, fine for a portfolio demo)
 COPY scripts/get_corpus.sh ./scripts/
+COPY models/wordvec.npz ./models/
 RUN ./scripts/get_corpus.sh \
-    && .venv/bin/findex index data/ --out index.bin --positions --executor serial
+    && .venv/bin/findex index data/ --out index.bin --positions --executor serial \
+    && .venv/bin/findex embed index.bin --out embeddings.npz --model models/wordvec.npz
 
 # ---------- runtime ----------
 FROM python:3.13-slim-bookworm
@@ -25,8 +27,10 @@ WORKDIR /app
 COPY --from=builder --chown=app:app /app/.venv /app/.venv
 COPY --from=builder --chown=app:app /app/data /app/data
 COPY --from=builder --chown=app:app /app/index.bin /app/index.bin
+COPY --from=builder --chown=app:app /app/embeddings.npz /app/embeddings.npz
 ENV PATH="/app/.venv/bin:$PATH" \
     INDEX_PATH=/app/index.bin \
+    EMBEDDINGS_PATH=/app/embeddings.npz \
     LOG_LEVEL=INFO \
     PYTHONUNBUFFERED=1
 USER app

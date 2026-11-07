@@ -13,3 +13,6 @@ dist/
 /mirror/
 /crawl*.jsonl
 /crawl.log
+/embeddings*.npz
+.benchmarks/
+benchmark.json

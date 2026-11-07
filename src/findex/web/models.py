@@ -29,6 +29,7 @@ class Hit(BaseModel):
 class SearchResponse(BaseModel):
     query: str
     scorer: str
+    mode: str
     total: int = Field(description="all documents matching the Boolean query")
     page: int
     k: int

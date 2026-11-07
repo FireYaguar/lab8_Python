@@ -30,6 +30,7 @@ from findex import __version__
 from findex.index import Index
 from findex.query import QueryError
 from findex.search import match, read_text, search
+from findex.semantic import SemanticIndex
 from findex.store import open_index
 from findex.web.models import DocumentOut, Health, Hit, SearchResponse, StatsOut
 from findex.web.settings import Settings
@@ -56,12 +57,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     t0 = time.perf_counter()
     with open_index(settings.index_path) as index:
         app.state.index = index
+        app.state.semantic = None
+        if settings.embeddings_path is not None:
+            app.state.semantic = SemanticIndex.load(settings.embeddings_path)
+            log.info(
+                "loaded %d chunk embeddings from %s",
+                len(app.state.semantic.E),
+                settings.embeddings_path,
+            )
         app.state.started = time.time()
         log.info(
             "loaded %r from %s in %.2f s", index, settings.index_path, time.perf_counter() - t0
         )
         yield
         app.state.index = None
+        app.state.semantic = None
 
 
 # ---------- dependencies ----------
@@ -81,19 +91,37 @@ Q = Annotated[str, Query(min_length=1, max_length=200, description='e.g. "event 
 K = Annotated[int, Query(ge=1, le=50, description="results per page")]
 PageNo = Annotated[int, Query(ge=1, le=100)]
 ScorerParam = Literal["bm25", "tfidf"]
+ModeParam = Literal["keyword", "semantic", "hybrid"]
 
 
-def run_search(index: Index, q: str, k: int, scorer: ScorerParam, page: int) -> SearchResponse:
+def get_semantic(request: Request) -> SemanticIndex | None:
+    return getattr(request.app.state, "semantic", None)
+
+
+SemanticDep = Annotated[SemanticIndex | None, Depends(get_semantic)]
+
+
+def run_search(
+    index: Index,
+    q: str,
+    k: int,
+    scorer: ScorerParam,
+    page: int,
+    mode: ModeParam = "keyword",
+    semantic: SemanticIndex | None = None,
+) -> SearchResponse:
     """Plain (blocking, CPU-bound) function shared by the JSON and HTML routes."""
     t0 = time.perf_counter()
     try:
-        total = len(match(index, q))
-        hits = search(index, q, scorer, k=k * page)[k * (page - 1) :]
+        hits_all = search(index, q, scorer, k=k * page, mode=mode, semantic=semantic)
+        total = len(match(index, q)) if mode == "keyword" else len(hits_all)
+        hits = hits_all[k * (page - 1) :]
     except QueryError as e:
         raise HTTPException(400, f"bad query: {e}") from None
     return SearchResponse(
         query=q,
         scorer=scorer,
+        mode=mode,
         total=total,
         page=page,
         k=k,
@@ -140,9 +168,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # a thread pool, so the event loop stays free (see README, Lab 7 measurements).
     @app.get("/search", response_model=SearchResponse)
     def search_route(
-        index: IndexDep, q: Q, k: K = 10, scorer: ScorerParam = "bm25", page: PageNo = 1
+        index: IndexDep,
+        semantic: SemanticDep,
+        q: Q,
+        k: K = 10,
+        scorer: ScorerParam = "bm25",
+        page: PageNo = 1,
+        mode: ModeParam = "keyword",
     ) -> SearchResponse:
-        return run_search(index, q, k, scorer, page)
+        return run_search(index, q, k, scorer, page, mode, semantic)
 
     @app.get("/docs/{doc_id}", response_model=DocumentOut)
     def document(index: IndexDep, doc_id: int) -> DocumentOut:
@@ -157,7 +191,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return StatsOut(
             documents=index.num_docs,
             terms=len(index),
-            postings=sum(len(p) for p in index.postings.values()),
+            postings=index.num_postings,
             avg_doc_length=round(index.avg_doc_length, 1),
             positions=index.has_positions,
             index_path=str(path),
@@ -179,16 +213,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def home(
         request: Request,
         index: IndexDep,
+        semantic: SemanticDep,
         q: Annotated[str, Query(max_length=200)] = "",
         k: K = 10,
         scorer: ScorerParam = "bm25",
         page: PageNo = 1,
+        mode: ModeParam = "keyword",
     ) -> HTMLResponse:
         result: SearchResponse | None = None
         error = ""
         if q.strip():
             try:
-                result = run_search(index, q, k, scorer, page)
+                result = run_search(index, q, k, scorer, page, mode, semantic)
             except HTTPException as e:
                 error = str(e.detail)
         return templates.TemplateResponse(
@@ -198,6 +234,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "q": q,
                 "k": k,
                 "scorer": scorer,
+                "mode": mode,
+                "has_semantic": semantic is not None,
                 "result": result,
                 "error": error,
                 "docs": index.num_docs,

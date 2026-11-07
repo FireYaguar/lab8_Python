@@ -13,4 +13,5 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     index_path: Path = Path("index.bin")
+    embeddings_path: Path | None = None  # EMBEDDINGS_PATH: enables mode=semantic|hybrid
     log_level: str = "INFO"

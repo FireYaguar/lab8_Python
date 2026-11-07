@@ -7,6 +7,11 @@
     <option value="bm25" {{ "selected" if scorer == "bm25" }}>BM25</option>
     <option value="tfidf" {{ "selected" if scorer == "tfidf" }}>TF-IDF</option>
   </select>
+  <select name="mode" aria-label="mode" {{ "disabled" if not has_semantic }}>
+    <option value="keyword" {{ "selected" if mode == "keyword" }}>keyword</option>
+    <option value="hybrid" {{ "selected" if mode == "hybrid" }}>hybrid</option>
+    <option value="semantic" {{ "selected" if mode == "semantic" }}>semantic</option>
+  </select>
   <button>Search</button>
 </form>
 <p class="hint">Syntax: <code>a b</code> (AND) · <code>a OR b</code> · <code>NOT a</code> · <code>"exact phrase"</code> · <code>( )</code></p>
@@ -28,9 +33,9 @@
   </ol>
   {% if result.pages > 1 %}
   <nav class="pages">
-    {% if result.page > 1 %}<a href="/?q={{ q | urlencode }}&scorer={{ scorer }}&k={{ k }}&page={{ result.page - 1 }}">← previous</a>{% endif %}
+    {% if result.page > 1 %}<a href="/?q={{ q | urlencode }}&scorer={{ scorer }}&mode={{ mode }}&k={{ k }}&page={{ result.page - 1 }}">← previous</a>{% endif %}
     <span>{{ result.page }} / {{ result.pages }}</span>
-    {% if result.page < result.pages %}<a href="/?q={{ q | urlencode }}&scorer={{ scorer }}&k={{ k }}&page={{ result.page + 1 }}">next →</a>{% endif %}
+    {% if result.page < result.pages %}<a href="/?q={{ q | urlencode }}&scorer={{ scorer }}&mode={{ mode }}&k={{ k }}&page={{ result.page + 1 }}">next →</a>{% endif %}
   </nav>
   {% endif %}
 {% endif %}

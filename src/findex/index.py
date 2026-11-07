@@ -10,6 +10,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import numpy.typing as npt
+
+from findex.arrays import LazyPostings, PostingArrays, RawPosting
 from findex.corpus import Document, iter_paths
 from findex.timing import timed
 from findex.tokenize import tokenize
@@ -40,12 +44,21 @@ class Index(Mapping[str, list[Posting]]):
 
     def __init__(
         self,
-        postings: dict[str, list[Posting]] | None = None,
+        postings: Mapping[str, list[Posting]] | None = None,
         doc_lengths: dict[int, int] | None = None,
         doc_meta: dict[int, DocMeta] | None = None,
         has_positions: bool = False,
+        *,
+        arrays: PostingArrays | None = None,
     ) -> None:
-        self.postings: dict[str, list[Posting]] = postings if postings is not None else {}
+        """Either `postings` (term -> list[Posting]) or ready `arrays` (fast path: merge, load)."""
+        if arrays is None:
+            given = dict(postings or {})
+            arrays = PostingArrays.from_postings(given, has_positions)
+            self.postings = LazyPostings(arrays, cache=given)
+        else:
+            self.postings = LazyPostings(arrays)
+        self.arrays = arrays
         self.doc_lengths: dict[int, int] = doc_lengths if doc_lengths is not None else {}
         self.doc_meta: dict[int, DocMeta] = doc_meta if doc_meta is not None else {}
         self.has_positions = has_positions
@@ -59,7 +72,7 @@ class Index(Mapping[str, list[Posting]]):
         return term in self.postings  # faster than Mapping's default (try/except __getitem__)
 
     def __iter__(self) -> Iterator[str]:
-        return iter(self.postings)
+        return iter(self.arrays.terms)
 
     def __len__(self) -> int:
         return len(self.postings)  # number of terms
@@ -95,11 +108,30 @@ class Index(Mapping[str, list[Posting]]):
     def doc_length(self, doc_id: int) -> int:
         return self.doc_lengths[doc_id]
 
+    @property
+    def num_postings(self) -> int:
+        return len(self.arrays.doc_ids)
+
+    @functools.cached_property
+    def doc_len_array(self) -> npt.NDArray[np.int32]:
+        """doc_id -> length as ONE int32 array (fancy-indexed by the NumPy scorers)."""
+        out = np.zeros(max(self.doc_lengths, default=-1) + 1, np.int32)
+        if self.doc_lengths:
+            out[np.fromiter(self.doc_lengths.keys(), np.int64)] = list(self.doc_lengths.values())
+        return out
+
+    def term_arrays(self, term: str) -> tuple[npt.NDArray[np.int32], npt.NDArray[np.int32]]:
+        """(doc_ids, tfs) of a term as array *views* (empty arrays if the term is absent)."""
+        span = self.postings.span(term)
+        s, e = span if span is not None else (0, 0)
+        return self.arrays.doc_ids[s:e], self.arrays.tfs[s:e]
+
     def df(self, term: str) -> int:
-        return len(self.postings.get(term, ()))
+        span = self.postings.span(term)
+        return span[1] - span[0] if span is not None else 0
 
     def doc_ids(self, term: str) -> list[int]:
-        return [p.doc_id for p in self.postings.get(term, ())]
+        return self.term_arrays(term)[0].tolist()
 
     # --- query cache: query string -> matching doc ids (see search.match) ---
     def _init_cache(self) -> None:
@@ -117,19 +149,23 @@ class Index(Mapping[str, list[Posting]]):
         self.match.cache_clear()
 
     # pickle: store only the data, not the cache closure or cached properties
+    # (Lab 8: arrays, not Posting objects — loading is a few buffer copies, not 331k
+    # dataclass __setstate__ calls)
     def __getstate__(self) -> dict[str, Any]:
         return {
-            "postings": self.postings,
+            "arrays": self.arrays.state(),
             "doc_lengths": self.doc_lengths,
             "doc_meta": self.doc_meta,
             "has_positions": self.has_positions,
         }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
-        self.__init__(**state)
-
-
-type RawPosting = tuple[int, int, tuple[int, ...]]  # (doc_id, tf, positions)
+        self.__init__(
+            doc_lengths=state["doc_lengths"],
+            doc_meta=state["doc_meta"],
+            has_positions=state["has_positions"],
+            arrays=PostingArrays(**state["arrays"]),
+        )
 
 
 @dataclass(slots=True)
@@ -137,7 +173,7 @@ class PartialIndex:
     """What one worker returns: postings for its own doc_id range (Lab 5).
 
     Postings are plain tuples (doc_id, tf, positions), not Posting objects: tuples pickle
-    ~10x faster between processes; merge() turns them into Postings in the parent."""
+    ~10x faster between processes; merge() turns them into NumPy arrays in the parent."""
 
     start_id: int
     postings: dict[str, list[RawPosting]]
@@ -191,18 +227,19 @@ def merge(partials: Iterable[PartialIndex]) -> Index:
     disjoint, increasing id ranges, so concatenation keeps every list sorted.
     Sequential — the Amdahl part of a parallel build."""
     parts = sorted(partials, key=lambda p: p.start_id)
-    postings: dict[str, list[Posting]] = {}
+    raw: dict[str, list[RawPosting]] = {}
     doc_lengths: dict[int, int] = {}
     doc_meta: dict[int, DocMeta] = {}
     for part in parts:
-        for term, raw in part.postings.items():
-            objs = [Posting(d, tf, pos) for d, tf, pos in raw]
-            existing = postings.get(term)
+        for term, plist in part.postings.items():
+            existing = raw.get(term)
             if existing is None:
-                postings[term] = objs
+                raw[term] = plist  # reuse the worker's list, no copy
             else:
-                existing.extend(objs)
+                existing.extend(plist)
         doc_lengths.update(part.doc_lengths)
         doc_meta.update(part.doc_meta)
     positions = parts[0].has_positions if parts else False
-    return Index(postings, doc_lengths, doc_meta, positions)
+    # Lab 8: straight into NumPy arrays; Posting objects are created lazily, when needed
+    arrays = PostingArrays.from_raw(raw, positions)
+    return Index(doc_lengths=doc_lengths, doc_meta=doc_meta, has_positions=positions, arrays=arrays)

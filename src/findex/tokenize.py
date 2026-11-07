@@ -18,11 +18,16 @@ import unicodedata
 from collections.abc import Iterator
 
 TOKEN_RE = re.compile(r"\w+(?:'\w+)*")
-_APOSTROPHES = str.maketrans({"’": "'", "ʼ": "'"})
+
+
+def fix_apostrophes(text: str) -> str:
+    """’ (U+2019) and ʼ (U+02BC) -> ASCII '. Two str.replace (C loops): str.translate with a
+    dict table walks the text much slower (Lab 8 profile)."""
+    return text.replace("\u2019", "'").replace("\u02bc", "'")
 
 
 def normalize(text: str) -> str:
-    return unicodedata.normalize("NFC", text).translate(_APOSTROPHES).casefold()
+    return fix_apostrophes(unicodedata.normalize("NFC", text)).casefold()
 
 
 def iter_spans(text: str) -> Iterator[tuple[str, int, int]]:
@@ -31,7 +36,7 @@ def iter_spans(text: str) -> Iterator[tuple[str, int, int]]:
     The regex runs on the NFC text *before* casefold (casefold can change string length,
     e.g. "ß" -> "ss"), so the offsets are usable for snippets in Lab 3.
     """
-    nfc = unicodedata.normalize("NFC", text).translate(_APOSTROPHES)  # 1:1 char mapping
+    nfc = fix_apostrophes(unicodedata.normalize("NFC", text))  # 1:1 char mapping
     for m in TOKEN_RE.finditer(nfc):  # finditer: lazy, no list of matches
         tok = m.group().casefold()
         if tok.strip("_"):

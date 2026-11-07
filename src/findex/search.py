@@ -11,15 +11,23 @@ import heapq
 import logging
 import re
 import unicodedata
-from collections import Counter, defaultdict
+from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, Literal
+
+import numpy as np
 
 from findex.index import Index
-from findex.query import parse
-from findex.scoring import SCORERS, Scorer, ScorerName
+from findex.query import QueryError, parse
+from findex.scoring import SCORERS, Scorer, ScorerName, VectorScorer
+from findex.semantic import rrf
 from findex.timing import timed
-from findex.tokenize import iter_spans
+from findex.tokenize import fix_apostrophes, tokenize
+
+if TYPE_CHECKING:
+    from findex.semantic import SemanticIndex
 
 log = logging.getLogger(__name__)
 SNIPPET_RADIUS = 80
@@ -46,31 +54,123 @@ def match(index: Index, query: str) -> tuple[int, ...]:
     return ids
 
 
-@timed
-def search(
-    index: Index, query: str, scorer: Scorer | ScorerName = "bm25", k: int = 10
-) -> list[SearchResult]:
-    """Top-k documents for a query. scorer: a Scorer object or its name ("bm25" | "tfidf")."""
-    if isinstance(scorer, str):
-        scorer = SCORERS[scorer]
-    ids = match(index, query)
-    if not ids:
-        return []
+type Engine = Literal["numpy", "python"]
+
+
+def score_python(
+    index: Index, ids: Sequence[int], terms: Sequence[str], scorer: Scorer, k: int
+) -> list[tuple[int, float]]:
+    """Lab 3 scorer: a Python loop over every posting, then heapq.nlargest."""
     wanted = set(ids)
-    terms = parse(query).terms()
-    scores: defaultdict[int, float] = defaultdict(float)
-    for d in ids:
-        scores[d] = 0.0  # matched docs without positive terms (e.g. "NOT x") still appear
+    scores: dict[int, float] = dict.fromkeys(ids, 0.0)  # "NOT x" matches still appear
     for term in terms:
         for posting in index.postings.get(term, ()):
             if posting.doc_id in wanted:
                 scores[posting.doc_id] += scorer(term, posting, index)
-    top = heapq.nlargest(k, scores.items(), key=lambda kv: kv[1])  # O(n log k), not a full sort
+    # nlargest is stable: equal scores keep ascending doc_id order
+    return heapq.nlargest(k, scores.items(), key=lambda kv: kv[1])  # O(n log k)
+
+
+def score_numpy(
+    index: Index, ids: Sequence[int], terms: Sequence[str], scorer: VectorScorer, k: int
+) -> list[tuple[int, float]]:
+    """Lab 8 scorer: per term ONE array expression over its postings, a scatter-add into a
+    dense score vector, then top-k with np.argpartition (O(n), not a sort)."""
+    scores = np.zeros(len(index.doc_len_array), np.float64)
+    for term in terms:
+        doc_ids, tfs = index.term_arrays(term)  # views into the CSR arrays, no copy
+        if len(doc_ids):
+            scores[doc_ids] += scorer.weights(term, doc_ids, tfs, index)  # ids unique per term
+    matched = np.asarray(ids, np.int64)
+    cand = scores[matched]
+    if len(cand) > k:
+        top = np.argpartition(cand, -k)[-k:]  # the k largest, unordered
+        keep = np.flatnonzero(cand >= cand[top].min())  # + everything tied with the k-th
+    else:
+        keep = np.arange(len(cand))
+    order = keep[np.lexsort((matched[keep], -cand[keep]))][:k]  # score desc, then doc_id asc
+    return [(int(matched[i]), float(cand[i])) for i in order]
+
+
+type Mode = Literal["keyword", "semantic", "hybrid"]
+HYBRID_DEPTH = 100  # how deep each ranking goes into RRF
+
+
+def rank_keyword(
+    index: Index, query: str, scorer: Scorer, k: int, engine: Engine = "numpy"
+) -> list[tuple[int, float]]:
+    """Boolean match (cached) + BM25/TF-IDF ranking -> [(doc_id, score)], no snippets."""
+    ids = match(index, query)
+    if not ids:
+        return []
+    terms = sorted(parse(query).terms())  # fixed order -> identical float sums in both engines
+    if engine == "numpy" and isinstance(scorer, VectorScorer):
+        return score_numpy(index, ids, terms, scorer, k)
+    return score_python(index, ids, terms, scorer, k)
+
+
+@timed
+def search(
+    index: Index,
+    query: str,
+    scorer: Scorer | ScorerName = "bm25",
+    k: int = 10,
+    engine: Engine = "numpy",
+    mode: Mode = "keyword",
+    semantic: SemanticIndex | None = None,
+) -> list[SearchResult]:
+    """Top-k documents for a query.
+
+    mode="keyword"  Boolean query language + BM25/TF-IDF (Labs 2-3, NumPy scorer of Lab 8)
+    mode="semantic" cosine similarity of embeddings, best chunk per document (Lab 8)
+    mode="hybrid"   both rankings fused with Reciprocal Rank Fusion
+    engine="python" is the Lab 3 scoring loop, kept for the equality test and the benchmark.
+    """
+    if isinstance(scorer, str):
+        scorer = SCORERS[scorer]
+    if mode != "keyword" and semantic is None:
+        raise QueryError("semantic index not loaded (build it with `findex embed`)")
+
+    keyword: list[tuple[int, float]] = []
+    if mode in ("keyword", "hybrid"):
+        try:
+            keyword = rank_keyword(
+                index, query, scorer, k if mode == "keyword" else HYBRID_DEPTH, engine
+            )
+        except QueryError:
+            if mode == "keyword":
+                raise
+            # hybrid: a query that is not valid query syntax still works semantically
+    best_chunk: dict[int, int] = {}
+    if mode == "keyword":
+        top = keyword
+    else:
+        assert semantic is not None
+        sem = semantic.rank(query, k if mode == "semantic" else HYBRID_DEPTH)
+        best_chunk = {d: c for d, _, c in sem}
+        if mode == "semantic":
+            top = [(d, s) for d, s, _ in sem]
+        else:
+            top = rrf([[d for d, _ in keyword], [d for d, _, _ in sem]])[:k]
+
+    try:
+        terms = parse(query).terms() if mode == "keyword" else set(tokenize(query))
+    except QueryError:
+        terms = set(tokenize(query))
+    # Highlight only informative terms: words found in more than half of all documents
+    # ("into", "the") would produce thousands of regex hits per page for no information.
+    informative = {t for t in terms if index.df(t) <= index.num_docs // 2}
+    terms = informative or terms
     results: list[SearchResult] = []
     for doc_id, score in top:
         meta = index.doc_meta[doc_id]
         text = read_text(meta.path)
-        results.append(SearchResult(score, doc_id, meta.title, meta.path, snippet(text, terms)))
+        snip = snippet(text, terms)
+        if not snip and doc_id in best_chunk and semantic is not None:
+            s, e = semantic.chunk_span[best_chunk[doc_id]].tolist()
+            nfc = unicodedata.normalize("NFC", text)
+            snip = re.sub(r"\s+", " ", nfc[s : min(e, s + 2 * SNIPPET_RADIUS)]).strip() + "…"
+        results.append(SearchResult(score, doc_id, meta.title, meta.path, snip))
     return results
 
 
@@ -79,13 +179,33 @@ def read_text(path: str) -> str:
     return p.read_text(encoding="utf-8", errors="replace") if p.is_file() else ""
 
 
+def _term_pattern(terms: frozenset[str]) -> re.Pattern[str]:
+    alt = "|".join(re.escape(t) for t in sorted(terms, key=len, reverse=True))
+    # same token boundaries as TOKEN_RE: not inside a word, not across an inner apostrophe
+    return re.compile(rf"(?<!\w)(?<!\w')(?:{alt})(?!\w)(?!'\w)", re.IGNORECASE)
+
+
+_patterns: dict[frozenset[str], re.Pattern[str]] = {}
+
+
 def snippet(text: str, terms: set[str], radius: int = SNIPPET_RADIUS) -> str:
     """A 2·radius window (±radius around the best occurrence) with the most distinct query
-    terms; query terms are highlighted as **term**. Sliding window: O(number of hits)."""
+    terms; query terms are highlighted as **term**. Sliding window: O(number of hits).
+
+    Lab 8: hits are found by ONE case-insensitive regex over the text (a C loop) instead of
+    tokenizing the whole document token by token in Python — the #1 hotspot of search."""
     if not text or not terms:
         return ""
-    nfc = unicodedata.normalize("NFC", text)  # iter_spans offsets point into the NFC text
-    hits = [(s, e, t) for t, s, e in iter_spans(text) if t in terms]
+    nfc = fix_apostrophes(unicodedata.normalize("NFC", text))
+    key = frozenset(terms)
+    pattern = _patterns.get(key)
+    if pattern is None:
+        pattern = _patterns.setdefault(key, _term_pattern(key))
+    hits = [
+        (m.start(), m.end(), t)
+        for m in pattern.finditer(nfc)
+        if (t := m.group().casefold()) in terms
+    ]
     if not hits:
         return ""
     window: Counter[str] = Counter()

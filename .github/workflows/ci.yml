@@ -17,6 +17,12 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run pyright
       - run: uv run pytest --cov --cov-report=term
+      - name: benchmarks (search, build_index); numbers in the log + artifact
+        run: uv run pytest tests/test_benchmarks.py --benchmark-enable --benchmark-json=benchmark.json --benchmark-columns=min,median,mean,max
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark
+          path: benchmark.json
       - run: uv build
       - uses: actions/upload-artifact@v4
         with:

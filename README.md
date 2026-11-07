@@ -2,633 +2,243 @@
 
 [![CI](https://github.com/OWNER/findex/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/findex/actions/workflows/ci.yml)
 
-**🔎 Live: https://findex-OWNER.onrender.com** · API: [`/docs`](https://findex-OWNER.onrender.com/docs) · health: [`/health`](https://findex-OWNER.onrender.com/health)
+**Повнотекстовий і семантичний пошук по документації Python, побудований з нуля за 8 лабораторних: від генератора, що читає файли, до задеплоєного FastAPI-сервісу.**
 
-Повнотекстовий пошуковик, який будую протягом семестру (курс «Python — Build a Search Engine», 8 лабораторних).
-Кожна лабораторна — окремий git-тег (`lab-01`, `lab-02`, …).
+**🔎 Live: https://findex-OWNER.onrender.com** · API: [`/docs`](https://findex-OWNER.onrender.com/docs) · [`/health`](https://findex-OWNER.onrender.com/health) · 🎬 [демо-відео (2–3 хв)](VIDEO_URL)
 
-## Корпус
+![пошук у findex](docs/demo.gif)
 
-**Документація Python**: вихідні тексти `.rst` з репозиторію CPython (`Doc/`): **560 документів, ~15 МБ, 1,8 млн токенів**.
-Документацію зручно шукати, і в Лабі 6 краулер додаватиме до цього ж корпусу сторінки docs.python.org (JSON-lines).
-
-Корпус не зберігається в git (`data/` у `.gitignore`). Завантажити його:
-
-```bash
-./scripts/get_corpus.sh      # sparse-clone CPython, копіює Doc/**/*.rst у data/python-docs/
-```
-
-## Встановлення і запуск
-
-```bash
-uv tool install .                         # команда findex у PATH (або: uv tool install <wheel з релізу>)
-uv sync                                   # середовище розробки
-uv run findex stats data/                 # лінива версія (за замовчуванням)
-uv run findex stats data/ --limit 100     # перші 100 документів (itertools.islice)
-uv run findex stats data/ --eager         # «жадібна» версія для порівняння
-uv run pytest
-uv run ruff check .
-```
-
-## Структура
-
-```
-src/findex/
-  corpus.py     # iter_documents(root) -> Iterator[Document]   (.txt/.rst/.md і .jsonl)
-  tokenize.py   # tokenize(text) -> Iterator[str], iter_spans(text) -> (token, start, end)
-  stats.py      # один прохід: документи, токени, словник, топ-N; час і пік пам'яті
-tests/test_tokenize.py
-scripts/get_corpus.sh
-```
-
-`iter_documents` і `tokenize` — генератори: `next(iter_documents(Path("data")))` повертається одразу, бо читає лише перший файл.
-Файли з поганим UTF-8 читаються з `errors="replace"`, а попередження йде в лог (обхід не падає).
-
-## Правила токенізації
-
-1. `unicodedata.normalize("NFC", …)`: `café` і `café` дають один токен.
-2. `str.casefold()` замість `lower()`: `Straße` → `strasse`.
-3. Токен — це послідовність `\w` (будь-яке письмо, зокрема кирилиця), регулярний вираз `\w+(?:'\w+)*` через `re.finditer`.
-4. **Апострофи**: апостроф *усередині* слова зберігається (`don't`, `п'ять`); `’` і `ʼ` перед цим замінюються на `'`. Лапки навколо слова відкидаються.
-5. **Дефіси** розділяють слова: `well-known` → `well`, `known`.
-6. **Цифри** залишаються токенами: `Python 3.12` → `python`, `3`, `12`.
-7. Токени, що складаються лише з `_` (rst-прикраси), відкидаються. Ідентифікатори на кшталт `__init__` і `snake_case` залишаються.
-
-Тести (`tests/test_tokenize.py`): регістр, кирилиця, комбінований наголос, пунктуація й дефіси, апострофи, цифри, підкреслення, порожній рядок, лінивість і JSON-lines для `iter_documents`.
-
-## Вимірювання: жадібна vs лінива версія
-
-Повний корпус (560 документів, 1 809 580 токенів, словник 42 603). Медіана з 3 запусків.
-Машина: Intel Xeon 2,1 ГГц, 2 ядра, Python 3.13. Пам'ять заміряна через `tracemalloc` (пік).
-
-| Версія | Документи | Пікова пам'ять | Час |
-|---|---|---|---|
-| eager (списки) | 560 | 109,3 MiB | 6,99 s |
-| lazy (генератори) | 560 | **6,8 MiB** | 6,72 s |
-| eager, `--limit 100` | 100 | 13,9 MiB | 0,74 s |
-| lazy, `--limit 100` | 100 | 6,8 MiB | 0,72 s |
-
-**Куди пішла пам'ять.** Жадібна версія одночасно тримає в RAM три речі: список усіх 560 текстів (~15 МБ рядків), список зі списками всіх 1,8 млн токенів (кожен елемент — це 8-байтовий покажчик плюс окремий об'єкт `str` приблизно на 50+ байтів) і `Counter`. Більшість зі ~109 MiB займають саме мільйони дрібних рядкових об'єктів, а не сам текст. Лінива версія в кожен момент тримає **один документ** (найбільший файл ≈ 260 КБ), поточний токен і `Counter` — єдиний «стік», який росте законно, бо містить відповідь (42 тис. унікальних термів). Тому її пік не залежить від розміру корпусу: на 100 і на 560 документах він однаковий (6,8 MiB, це переважно `Counter`), а пік жадібної версії росте лінійно. Нулем пік не буває: `Counter` і один документ потрібні завжди. Час майже однаковий, бо основну роботу (regex, NFC, casefold) обидві версії виконують однаково; лінива навіть трохи швидша, бо не алокує списки.
-
----
-
-# Лабораторна 2 — інвертований індекс
-
-## Що зроблено
-
-```
-src/findex/
-  index.py    # Posting, DocMeta, індекс, build_index()
-  boolean.py  # двовказівникові merge_and/or/not, set-альтернатива (у Лабі 3 винесено з search.py)
-  store.py    # save/load: pickle (index.bin) або JSON (index.json) — за розширенням файлу
-scripts/lab02_measure.py   # усі таблиці нижче
-tests/test_index.py        # побудова, hashable-записи, запити (обидва движки), merge == set, round-trip
-```
-
-- `Posting(doc_id, tf, positions=())` і `DocMeta(doc_id, path, title)` — `@dataclass(frozen=True, slots=True)`, тобто їх можна класти в `set`.
-- `build_index` робить **один прохід** по лінивому `iter_documents` → `tokenize`. Для поточного документа рахується `Counter`, його вміст скидається в `defaultdict(list)` постінгів, після чого `Counter` викидається. `doc_id` приходять за зростанням, тому списки постінгів відсортовані без окремого сортування. Також зберігаються `doc_lengths` (знадобляться для BM25 у Лабі 3) і `doc_meta`.
-- `--positions` додає до постінгів порядкові номери токенів (знадобляться для фраз у Лабі 3).
-
-```bash
-uv run findex index data/ --out index.bin [--positions] [--limit N]   # або --out index.json
-uv run findex search index.bin "async OR await NOT thread"   # з Лаби 3 — ранжований пошук
-uv run python scripts/lab02_measure.py data/
-```
-
-Синтаксис запиту: `a b` = AND, `a OR b`, `a NOT b`, `NOT b` (з Лаби 3 — повноцінний парсер, див. нижче).
-Обидві команди друкують час і пік пам'яті (`tracemalloc`). Під `tracemalloc` усе виконується в 2–3 рази повільніше, тому в таблицях нижче час заміряно без нього.
-
-Корпус: 560 документів, 42 603 терміни, 331 826 постінгів. Машина та сама, що в Лабі 1.
-
-## merge vs set
-
-Час одного виклику (`timeit.autorange`) на списках `doc_id`:
-
-| Терміни | df | Op | merge (µs) | set (µs) |
-|---|---|---|---|---|
-| 2 найчастіші: `in`, `the` | 536 / 552 | AND | 48.4 | 18.0 |
-| 2 найчастіші: `in`, `the` | 536 / 552 | OR | 51.1 | 16.9 |
-| 2 найрідкісніші: `authoring`, `linklint` | 1 / 1 | AND | 0.1 | 0.2 |
-| 2 найрідкісніші: `authoring`, `linklint` | 1 / 1 | OR | 0.2 | 0.2 |
-| частий + рідкісний: `the`, `authoring` | 552 / 1 | AND | 0.1 | 4.4 |
-| частий + рідкісний: `the`, `authoring` | 552 / 1 | OR | 1.6 | 9.4 |
-
-Обидва алгоритми мають складність O(len(a) + len(b)), але різну константу. Кожен крок merge — це байткод Python у циклі `while`. `set(a) & set(b)` виконує ту саму роботу всередині C. Тому на двох **довгих** списках set приблизно у 2,5–3 рази швидший, навіть з урахуванням `sorted()` результату. Merge виграє, коли **один список короткий**: AND зупиняється, щойно короткий список закінчився (0,1 µs), а set однаково хешує всі 552 елементи довгого. На наших 560 документах різниця — мікросекунди. Merge залишаю за замовчуванням, бо він працює потоково, не потребує хешування і переноситься на фразові запити та стиснені постінги (Лаби 3 і 8).
-
-## Збереження: pickle vs JSON
-
-Медіана з 3 запусків:
-
-| Формат | Позиції | Розмір файлу | save (s) | load (s) |
-|---|---|---|---|---|
-| pickle | ні | 5.6 MiB | 0.80 | 0.94 |
-| json | ні | 3.3 MiB | 0.46 | 0.49 |
-| pickle | так | 11.1 MiB | 1.11 | 1.24 |
-| json | так | 13.0 MiB | 1.91 | 1.00 |
-
-Без позицій JSON вийшов **меншим і швидшим**, бо `store.py` пише його колонками (`{"doc_ids": [...], "tfs": [...]}`) без імені класу на кожному записі. Pickle натомість зберігає 331 тис. окремих об'єктів `Posting`, і кожен frozen+slots dataclass при завантаженні відновлюється через Python-рівневий `__setstate__` (див. таблицю пам'яті: звичайний dataclass вантажиться в 4 рази швидше). З позиціями JSON стає більшим, бо кожне число записується текстом.
-**Позиції** збільшують файл у 2 рази (5,6 → 11,1 MiB pickle), а пік пам'яті під час побудови — з 29 до 106 MiB.
-
-**Чому `pickle.load` чужого файлу небезпечний:** потік pickle — це програма для віртуальної машини, яка може наказати завантажувачу викликати будь-яку імпортовану функцію (наприклад, `os.system("...")`) під час відновлення об'єктів. Завантажити pickle з мережі означає виконати чужий код. Тому pickle підходить лише для власного файлу індексу; про це є коментар у `store.py`. Для обміну даними — JSON.
-
-## Пам'ять: три представлення постінгів
-
-Кожне представлення збирається з корпусу під `tracemalloc`. «Retained» — пам'ять, яку займає готовий індекс після побудови (`tracemalloc` current).
-
-| Представлення постінгів | Пік (побудова) | Retained індекс | Файл (pickle) | Load (s) |
-|---|---|---|---|---|
-| `list[Posting]`, звичайний `@dataclass` | 38.7 MiB | 36.6 MiB | 6.5 MiB | 0.17 |
-| `list[Posting]`, `slots=True` | 26.3 MiB | 23.9 MiB | 5.3 MiB | 0.71 |
-| пари `array('I')` (doc_ids, tfs) | **17.6 MiB** | **15.1 MiB** | **4.4 MiB** | **0.04** |
-
-**Куди пішли байти.** Спільна частина всіх трьох рядків — словник на 42,6 тис. термінів (самі рядки-ключі плюс хеш-таблиця), це кілька MiB. Решту займають 331 826 постінгів:
-- **Звичайний dataclass**: кожен постінг — це об'єкт (~48 байтів) плюс власний `__dict__` для атрибутів (~50+ байтів), плюс 8-байтовий покажчик у списку. Разом ~110 байтів на постінг, приблизно 36 MiB. Малі `int` (< 257) кешовані, тому окремих об'єктів для `tf` майже немає.
-- **`slots=True`**: `__dict__` зникає, поля лежать у фіксованих C-слотах прямо в об'єкті (~48 байтів). Разом з покажчиком у списку це ~56 байтів на постінг, тобто приблизно на третину менше.
-- **`array('I')`**: об'єктів немає зовсім, лише сирі 4-байтові числа: 8 байтів на постінг (doc_id + tf) плюс невеликий заголовок масиву на кожен термін. Ось чому це найменший і найшвидший для завантаження варіант (pickle просто копіює буфер). У Лабі 8 ці масиви без копіювання стануть NumPy-масивами (`np.frombuffer`).
-
-У поточному індексі використано `slots=True`, як вимагає лаба. `array` залишено для Лаби 8.
-
----
-
-# Лабораторна 3 — рейтинг і модель об'єктів
-
-## Що зроблено
-
-```
-src/findex/
-  index.py    # class Index(Mapping[str, list[Posting]]); build_index() @timed
-  query.py    # рекурсивний спуск -> дерево Term / Phrase / And / Or / Not (&, |, ~, evaluate)
-  scoring.py  # протокол Scorer; TfIdf, BM25(k1=1.5, b=0.75)
-  search.py   # search(): match (lru_cache) -> бали -> heapq.nlargest -> SearchResult + сніпет
-  store.py    # load() @timed, open_index() — context manager
-  timing.py   # @timed з functools.wraps (лог DEBUG)
-scripts/lab03_eval.py      # sanity-check і precision@5 (таблиці нижче)
-tests/test_lab03.py        # дерева парсера, dunder-и, скорери, кеш, сніпети, open_index при винятку
-```
-
-- **`Index`** наслідує `collections.abc.Mapping`: працюють `len(ix)` (кількість термінів), `"python" in ix`, `ix["python"]` (`KeyError`, якщо терміна немає), `for t in ix`, `repr(ix)` → `Index(terms=42_604, docs=560, positions=True)`, а також `keys()/items()/get()` безкоштовно. Крім того є `num_docs`, `avg_doc_length` і `all_doc_ids` (`cached_property`: рахуються один раз, а не для кожного документа), `doc_length()`, `df()`. Для pickle `__getstate__` зберігає лише дані, без кешів.
-- **`open_index(path)`** — це `@contextmanager` з `try/finally`, тому `close()` (очищення кешу) виконується навіть при винятку; це перевіряє окремий тест.
-- **`Scorer`** — `typing.Protocol` з `__call__(term, posting, index) -> float`. `TfIdf` і `BM25` не мають спільного предка, і `search(..., scorer=...)` приймає будь-який із них.
-- **`SearchResult`** — `@dataclass(frozen=True, slots=True, order=True)` з першим полем `score`, тож `sorted(results)` сортує за балом.
-- **Парсер**: `python AND (async OR await) NOT java "event loop"` → `And(And(And(Term('python'), Or(Term('async'), Term('await'))), Not(Term('java'))), Phrase(('event', 'loop')))`. Тести порівнюють дерева, наприклад `parse("a OR b c") == Or(Term("a"), And(Term("b"), Term("c")))`. `Phrase` використовує позиції (індекс треба будувати з `--positions`): позиція `p` першого слова плюс `p+1`, `p+2`, … наступних.
-- **Сніпети**: вікно ±80 символів навколо місця, де поруч найбільше різних термінів запиту; терміни виділяються як `**term**`. Зсуви беруться з `iter_spans` (regex на NFC-тексті до `casefold`, бо `casefold` може змінити довжину рядка).
-
-```bash
-uv run findex index data/ --out index.bin --positions
-uv run findex -vv search index.bin 'python AND (async OR await) NOT java "event loop"' -k 3
-uv run python scripts/lab03_eval.py index.bin
-```
-
-## Сліди @timed і кешу
-
-Той самий запит двічі в одному процесі (лог з CLI Лаби 3; з Лаби 4 кеш перевіряє тест `test_search_results_sorted_and_cached`):
-
-```
-DEBUG findex.timing: load took 822.8 ms
-DEBUG findex.timing: match took 2.1 ms          <- 1-й раз: розбір і обчислення дерева
-DEBUG findex.timing: search took 45.6 ms
-DEBUG findex.search: cache hit for 'python AND (async OR await) NOT java "event loop"'
-DEBUG findex.timing: search took 43.6 ms        <- 2-й раз: match не виконувався (немає рядка "match took")
-
- 1.  18.53  A conceptual overview of :mod:`!asyncio`  (data/python-docs/howto/a-conceptual-overview-of-asyncio.rst)
-    …he **event** **loop**...") **async** def main(): task_b = asyncio.create_task(coro_b()) …
- 2.  18.36  Developing with asyncio  (data/python-docs/library/asyncio-dev.rst)
-    …the **event** **loop**, no other Tasks can run in the same thread. When a Task executes an ``**await**`` …
-```
-
-`@timed` стоїть *під* `@lru_cache` на `match`, тому рядок `match took` з'являється лише при промаху кешу. Основний час пошуку (~43 мс) іде на сніпети: для топ-k документів файл читається з диска і токенізується заново. Перший варіант вибору вікна був квадратичним (79 мс); після переходу на ковзне вікно O(кількість входжень) — 45 мс.
-
-## Три перевірки рейтингу (на корпусі)
-
-**1. Рідкий термін вище частого.** Запит `class OR winsound` (df 380 проти 5): документи, де є лише рідкий `winsound`, стоять вище за всі документи, де є лише частий `class` (BM25 idf: 4,6 проти 0,4).
-
-| rank | BM25 | document | містить |
-|---|---|---|---|
-| 1 | 10.83 | `library/winsound.rst` | winsound |
-| 2 | 8.35 | `library/windows.rst` | winsound |
-| 3 | 8.22 | `extending/windows.rst` | winsound |
-| 4 | 6.13 | `whatsnew/3.6.rst` | class, winsound |
-| 6 | 0.96 | `library/collections.abc.rst` | class (найкращий документ лише з `class`) |
-
-**2. 20-те повторення майже нічого не додає.** Термін `loop`, документ середньої довжини (3 231 токен):
-
-| tf | TF-IDF | BM25 |
+| Корпус | p95 пошуку | Найбільше прискорення |
 |---|---|---|
-| 1 | 1.58 | 1.581 |
-| 2 | 3.17 | 2.258 |
-| 5 | 7.92 | 3.039 |
-| 10 | 15.83 | 3.436 |
-| 19 | 30.08 | 3.662 |
-| 20 | 31.66 | 3.675 |
+| **560** документів · 15 МБ · 1,8 млн токенів · 42,6 тис. термінів | **95 мс** (10 одночасних клієнтів, 4 воркери, локально) | **49×** завантаження індексу (890 → 18 мс), NumPy-скорер **до 12,7×** |
 
-20-те входження додає до TF-IDF +1,58 (стільки ж, скільки перше), а до BM25 лише +0,013 (0,9 % від першого): це насичення через `k1`.
+---
 
-**3. Короткий документ з одним входженням вище довгого.** Термін `winsound`, в обох документах tf = 1:
+## Що вміє
 
-| document | довжина | TF-IDF | BM25 |
-|---|---|---|---|
-| `library/windows.rst` | 26 | 4.72 | 8.35 |
-| `whatsnew/3.13.rst` | 15,052 | 4.72 | 1.75 |
+- **Мова запитів**: `python AND (async OR await) NOT java "event loop"` (AND/OR/NOT, дужки, фрази).
+- **Рейтинг** BM25 або TF-IDF, векторизований на NumPy; **семантичний** режим (ембединги фрагментів, косинусна близькість) і **гібрид** через Reciprocal Rank Fusion.
+- **CLI** `findex index | crawl | embed | search | stats | serve`, **HTTP API** з OpenAPI на `/docs` і **вебсторінка** зі сніпетами та підсвіткою.
+- **Async-краулер** з `robots.txt`, лімітами на хост, повторами й backoff.
+- Типи (pyright strict), **184 тести** (pytest, Hypothesis, pytest-benchmark; 3 повільні під маркером `slow`), покриття 93 %, CI, Docker.
 
-TF-IDF не розрізняє ці документи, а BM25 через нормалізацію довжини (`b = 0.75`) дає короткому документу бал у 4,8 раза вищий. При `b = 0` бали були б рівні.
+## Швидкий старт
 
-## precision@5: TF-IDF vs BM25
+```bash
+uv tool install .                                    # або: uv sync (для розробки)
+./scripts/get_corpus.sh                              # документація Python з CPython -> data/
+findex index data/ --out index.bin --positions       # ~2 с (процеси, усі ядра)
+findex embed index.bin --out embeddings.npz          # ~3 с, вектори слів з models/wordvec.npz
+findex search index.bin '"event loop" NOT thread'
+findex search index.bin "turn objects into bytes" --mode hybrid
+findex serve --index index.bin --embeddings embeddings.npz   # http://127.0.0.1:8000/
+```
 
-10 запитів, релевантні документи розмічені вручну **до** запуску пошуку (`QRELS` у `scripts/lab03_eval.py`). P@5 = (кількість релевантних у топ-5) / 5. Колонка «max» показує найкраще можливе значення, коли релевантних документів менше п'яти.
+Docker: `docker build -t findex . && docker run -p 8000:8000 findex` (корпус, індекс і ембединги будуються всередині образу).
 
-| Запит | релевантних | max P@5 | TF-IDF | BM25 |
+## Як влаштовано
+
+```mermaid
+flowchart LR
+    C["Корпус: .rst/.txt/.jsonl<br/><i>Lab 1: генератори</i>"] --> T
+    W["Краулер asyncio + httpx<br/><i>Lab 6</i>"] -- JSONL --> C
+    T["Токенізатор NFC + casefold<br/><i>Lab 1</i>"] --> I
+    I["Інвертований індекс<br/><i>Lab 2 dict → Lab 5 процеси → Lab 8 NumPy CSR</i>"] --> S
+    I --> E["Ембединги фрагментів<br/><i>Lab 8</i>"]
+    S["Скорер BM25 / TF-IDF + парсер запитів<br/><i>Lab 3 → Lab 8 NumPy</i>"] --> H
+    E --> H["Гібрид RRF<br/><i>Lab 8</i>"]
+    H --> A["FastAPI /search /docs /stats /health<br/><i>Lab 7</i>"]
+    A --> U["Jinja2 UI<br/><i>Lab 7</i>"]
+    H --> L["CLI typer + rich<br/><i>Lab 4</i>"]
+```
+
+| Шар | Файли | Лаба |
+|---|---|---|
+| Корпус, токенізатор | `corpus.py`, `tokenize.py` | 1 |
+| Індекс, Boolean-merge, збереження | `index.py`, `boolean.py`, `store.py`, `arrays.py` | 2, 8 |
+| Об'єктна модель `Index`, парсер, BM25/TF-IDF, сніпети | `index.py`, `query.py`, `scoring.py`, `search.py` | 3, 8 |
+| CLI, пакування, тести, CI | `cli.py`, `pyproject.toml`, `tests/`, `.github/` | 4 |
+| Паралельна збірка | `parallel.py` | 5 |
+| Краулер | `crawler/` | 6 |
+| Веб, Docker | `web/`, `Dockerfile`, `render.yaml` | 7 |
+| Семантика, гібрид | `semantic.py` | 8 |
+
+Детальні звіти Лаб 1–7 зібрані в [docs/LABS.md](docs/LABS.md).
+
+---
+
+## Лабораторна 8 — швидше, потім розумніше
+
+### 1. Профіль до будь-яких правок
+
+Інструменти: `cProfile` (які функції), `py-spy` (вибірковий, flame graph), Scalene (Python- чи нативний час по рядках). Скрипти: `scripts/lab08_profile_search.py` (50 × запит із трьох термінів `python async queue`), `scripts/lab08_profile_index.py`, файли `.prof` лежать у `docs/profiles/`.
+
+Flame graphs: [пошук до](docs/flame_search_before.svg) · [пошук після](docs/flame_search_after.svg) · [збірка до](docs/flame_index_before.svg) · [збірка після](docs/flame_index_after.svg)
+
+**Три гарячі місця, записані до правок:**
+
+| # | Де | Скільки | Python чи нативний (Scalene) | Гіпотеза |
 |---|---|---|---|---|
-| `"event loop"` | 5 | 1.0 | 0.6 | 1.0 |
-| `"regular expression"` | 2 | 0.4 | 0.4 | 0.4 |
-| `unicode normalization` | 2 | 0.4 | 0.4 | 0.4 |
-| `"garbage collector"` | 4 | 0.8 | 0.6 | 0.6 |
-| `"context manager"` | 3 | 0.6 | 0.2 | 0.2 |
-| `thread lock` | 3 | 0.6 | 0.2 | 0.4 |
-| `json decode` | 1 | 0.2 | 0.2 | 0.2 |
-| `pickle unpickling security` | 4 | 0.8 | 0.2 | 0.2 |
-| `decorator wraps` | 1 | 0.2 | 0.2 | 0.2 |
-| `"virtual environment"` | 4 | 0.8 | 0.4 | 0.6 |
-| **середнє** | | **0.58** | **0.34** | **0.42** |
+| 1 | `search` → `snippet` → `iter_spans`: щоб знайти терміни для сніпета, **кожен документ топ-10 токенізується повністю** | 11,55 з 11,67 с усього `search` (50 запитів під cProfile) — **99 %** | рядок `yield tok, m.start(), m.end()` — переважно **Python** (генератор на кожен з тисяч токенів); `casefold`/`normalize`/`translate` — нативні | шукати лише терміни запиту одним регулярним виразом, щоб цикл був у C |
+| 2 | `findex search` / старт сервісу → `pickle.load` індексу | `_dataclass_setstate` — 1,32 з 1,57 с `pickle.load` (весь CLI — 1,99 с): **332 тис. викликів** | **Python**: frozen+slots датаклас відновлюється через Python-рівневий `__setstate__` | зберігати постінги масивами: pickle скопіює кілька буферів замість 331 тис. об'єктів |
+| 3 | `findex index` → `tokenize`/`iter_spans` | `tokenize` — 4,72 с із 9,47 с прогону під cProfile | змішаний: regex/`casefold` нативні, але `yield` на кожен токен — Python | генератор лишається (Лаба 1), але прибрати зайві проходи по тексту, а NumPy-масиви будувати одразу з кортежів воркерів, без 331 тис. `Posting` |
 
-BM25 виграє (0,42 проти 0,34; стеля 0,58). Різницю видно на `"event loop"` і `thread lock`. TF-IDF лінійний за tf і не штрафує довжину, тому підіймає довгі документи з багатьма згадками: `asyncio-task.rst` і `asyncio-protocol.rst` в одному випадку, `multiprocessing.rst` і `glossary.rst` в іншому. BM25 ставить на їхнє місце короткі профільні сторінки (`asyncio-runner.rst`, `asyncio-dev.rst`, `_thread.rst`). Де обидва програли, це через мене і через AND, а не через формулу:
-- `"context manager"`: обидва ставлять першим `contextlib.rst`, далі йдуть модулі, які справді надають context managers (`tempfile`, `multiprocessing`, `decimal`). Моя розмітка (`datamodel`, `compound_stmts`) виявилася занадто вузькою.
-- `pickle unpickling security`: неявний AND пропускає лише 4 документи, що містять усі три слова; у `pickletools`, `copyreg`, `shelve` їх немає. Для таких запитів краще підійшов би OR з рейтингом.
+Сам скорер BM25 (тема лаби) у профілі **не** гарячий: 0,05–0,6 мс на запит. Його я векторизував, як вимагає лаба, але головний виграш у сервісі дали пункти 1–2.
 
-Вибірка мала й шумна, але звичка міряти рейтинг закладена; у Лабі 8 ці 10 запитів стануть основою оцінки гібридного пошуку.
+**Результат** (`scripts/lab08_baseline.py`, медіана):
 
----
-
-# Лабораторна 4 — типи, тести, пакування, CLI
-
-## Встановлення і команди
-
-```bash
-uv tool install .                                   # з репозиторію
-uv tool install findex-0.4.0-py3-none-any.whl       # або з wheel релізу v0.4.0
-findex --help
-findex index data/ --out index.bin --positions      # смуга прогресу rich (stderr); з Лаби 5: --workers/--executor
-findex search index.bin '"event loop" NOT thread' -k 5 [--scorer bm25|tfidf]
-findex search index.bin python --json | jq .title   # JSON lines у stdout
-findex stats data/ --top 20 [--eager]
-findex -v ...  / findex -vv ...                     # INFO / DEBUG логи (до підкоманди)
-python -m findex ...                                # те саме без встановлення
-```
-
-- **Точка входу**: `[project.scripts] findex = "findex.cli:app"`. Після встановлення wheel у `bin/` з'являється скрипт `findex`, який імпортує `findex.cli` і викликає `app()`.
-- **stdout/stderr**: таблиці й `--json` йдуть у stdout; логи (`RichHandler`), смуга прогресу й помилки — у stderr. Логер налаштовується **один раз** у `cli.root` (`-v` → INFO, `-vv` → DEBUG); у бібліотеці лише `logging.getLogger(__name__)`. Діагностичних `print` у бібліотеці не лишилося; `measure`, `@timed` і кеш пишуть у лог.
-- **Очікувані помилки** дають один рядок без traceback і ненульовий код виходу:
-  ```
-  $ findex search nope.bin x          ->  error: index file not found: nope.bin (build it with `findex index`)   exit 1
-  $ findex search index.bin '(python' ->  error: bad query: missing ')'                                         exit 2
-  ```
-- Старі `python -m findex.index/search/stats` (argparse) замінені на підкоманди typer.
-
-## Типи (pyright strict)
-
-`[tool.pyright] typeCheckingMode = "strict"`, перевіряються `src/` і `tests/`: **0 errors**. `scripts/` (разові скрипти вимірювань) у перевірку не входять.
-- `Scorer` — `typing.Protocol` (`__call__(term, posting, index) -> float`); `TfIdf` і `BM25` йому відповідають структурно, без наслідування.
-- Генератори повертають `Iterator[...]`, функції приймають `Iterable[...]` (`build_index(docs: Iterable[Document])`).
-- `Literal`: `type ScorerName = Literal["bm25", "tfidf"]`, `type Engine = Literal["merge", "set"]`. У CLI це `StrEnum`, бо typer будує варіанти вибору з Enum.
-- PEP 695: `def timed[**P, R](fn: Callable[P, R]) -> Callable[P, R]`, `def measure[T](...)`.
-- `# type: ignore` два, і кожен з поясненням: `__hash__ = None` в `Index` (змінний контейнер з рівністю за значенням) і присвоєння полю frozen-датакласу в тесті (саме його падіння й перевіряється).
-
-## Тести
-
-**63 тести** (pytest), з них 4 властивості Hypothesis; спільні фікстури (крихітний корпус, індекс, файл індексу) лежать у `tests/conftest.py`.
-
-| Файл | Що перевіряє |
-|---|---|
-| `test_tokenize.py` | parametrize-таблиця: регістр, `ß`, кирилиця, NFC, дефіси, апострофи, цифри, `_`, порожній рядок; зсуви `iter_spans` |
-| `test_corpus.py` | лінивість, JSON-lines, зламаний UTF-8, `count_documents` |
-| `test_index.py` | постінги й позиції, hashable/frozen, dunder-и `Index`, Boolean-запити, save/load (pickle і JSON), `open_index` при винятку |
-| `test_search.py` | дерева парсера, помилки парсера, фрази, обидва скорери, **три sanity-check BM25 з Лаби 3**, кеш, `@timed` + `wraps`, сніпети |
-| `test_properties.py` | Hypothesis: токени непорожні й токенізація ідемпотентна; постінги завжди відсортовані; merge == set для AND/OR/NOT; `load(save(ix)) == ix` |
-| `test_cli.py` | `CliRunner`: `--help/--version`, index→search, `--json`, stats, помилки з кодами 1/2 без traceback, логи лише в stderr; `slow`: повний корпус |
-| `test_parallel.py`, `test_crawler.py` | додані в Лабах 5 і 6 |
-
-```bash
-uv run pytest                      # швидкі (< 1 с); маркер slow пропущено через addopts
-uv run pytest -m slow              # лише повільні (індекс на всьому корпусі, ~25 с)
-uv run pytest -m "" --cov          # усе + покриття
-```
-
-**Покриття: 97 %** (692 інструкції, 24 не покриті; `pytest -m "" --cov`). Навмисно не покрито:
-- `__main__.py` і гілка `PackageNotFoundError` в `__init__.py`: запуск без встановленого пакета, перевіряється вручну;
-- `compute_stats_eager` і `measure`-шлях `findex stats --eager`: це навмисно погана версія з Лаби 1, потрібна лише для таблиці;
-- гілки помилок, які важко відтворити в тесті: зламаний (не наш) файл індексу, некоректний вузол парсера, порожній корпус (`avg_doc_length` = 0).
-
-## CI і реліз
-
-`.github/workflows/ci.yml` запускається на кожен push і PR: `uv sync --locked` → `ruff check` → `ruff format --check` → `pyright` → `pytest --cov` → `uv build` (wheel як artifact).
-
-Реліз **v0.4.0**: `uv build` → `dist/findex-0.4.0-py3-none-any.whl` прикріплений до GitHub Release. Перевірено встановлення в чисте оточення (окремі `UV_TOOL_DIR`, без репозиторію і `.venv`):
-```
-$ uv tool install findex-0.4.0-py3-none-any.whl && findex --version
-findex 0.4.0
-```
-
----
-
-# Лабораторна 5 — конкурентність і GIL
-
-## Що зроблено
-
-```
-src/findex/index.py     # build_partial(paths, start_id) -> PartialIndex;  merge(partials) -> Index
-src/findex/parallel.py  # make_chunks(), build_parallel(..., executor=serial|threads|processes)
-src/findex/corpus.py    # list_sources(), source_size(): діапазони doc_id відомі наперед
-scripts/lab05_run.py    # один вимір у свіжому процесі (wall, CPU, RSS, merge) -> JSON
-scripts/lab05_bench.py  # усі конфігурації x 3 прогони -> таблиця + docs/lab05_speedup.png
-scripts/lab05_race.py   # гонитва на спільному Counter: GIL vs 3.13t
-tests/test_parallel.py  # serial == Lab 4, три виконавці дають однаковий індекс, падіння воркера
-```
-
-```bash
-findex index data/ --out index.bin                                   # типово: processes, workers = cpu_count
-findex -v index data/ --out index.bin --executor threads --workers 4
-uv run python scripts/lab05_bench.py data/ --ft .venv-ft/bin/python  # бенчмарк (див. нижче про 3.13t)
-```
-
-- **Map-reduce.** `build_partial(paths, start_id)` — функція рівня модуля, тож процес може її отримати через pickle. У воркер передаються **шляхи**, а не прочитані документи: кожен воркер сам читає свої файли. `merge` склеює постінги за термінами в порядку `doc_id`.
-- **Унікальні `doc_id`.** Кожне джерело заздалегідь резервує діапазон: текстовий файл — 1 id, `.jsonl` — по одному на рядок (`source_size`). `make_chunks` ділить відсортований список файлів на шматки приблизно однакового **розміру в байтах** і дає кожному свій `start_id` (префіксна сума). Тому `doc_id` не залежать від того, як корпус поділено на шматки.
-- **Однаковий результат.** `merge([build_partial(усі шляхи, 0)]) == build_index(iter_documents(...))` перевіряє окремий тест. Ще один тест (`slow`) на повному корпусі показує, що `processes` дає той самий індекс; файли pickle для serial, threads і processes збігаються **байт-у-байт** (`cmp`).
-- **Безпека для spawn.** `ProcessPoolExecutor(mp_context=get_context("spawn"))` запускає чистий інтерпретатор на воркер. `python -m findex` тепер під `if __name__ == "__main__"`, бо під spawn дочірній процес заново імпортує `__main__`; console-script `findex` має такий захист сам.
-- **Падіння воркера.** `fut.result()` перекидає виняток у батьківський процес разом зі стеком воркера (`__cause__`, `_RemoteTraceback`). Решта шматків скасовується (`shutdown(cancel_futures=True)`), тож нічого не зависає. Це перевіряє тест `test_worker_error_propagates`.
-- **Податок pickle, виміряний і зменшений.** Спочатку воркер повертав об'єкти `Posting`, і батьківський процес послідовно розпаковував 331 тис. frozen-slots датакласів **0,84 с**; процеси були повільніші за serial. Тепер воркер повертає прості кортежі `(doc_id, tf, positions)`: pickle займає 0,05 с, розмір — 2,7 MiB замість 5,6. Об'єкти `Posting` створює `merge`, і це послідовна частина збірки.
-
-## Машина
-
-**Intel Xeon @ 2,1 ГГц, 2 ядра (1 потік на ядро), `os.cpu_count() = 2`**, Linux, CPython 3.13.18; free-threaded збірка — CPython 3.13.14t. Корпус: 560 файлів, 15 МБ, 1,8 млн токенів.
-
-## Бенчмарк
-
-Кожна клітинка — медіана з 3 прогонів, кожен прогін у **свіжому процесі** (`lab05_run.py`), щоб пік RSS батьківського процесу (`ru_maxrss`) належав саме цьому прогону. CPU = user + sys батьківського процесу **і** завершених воркерів (`os.times()`). «±» — розкид (max − min) wall за трьома прогонами. Прискорення рахується відносно serial на звичайній збірці з GIL. Набір воркерів {1, 2, 4, 8, cpu_count}, а cpu_count тут 2.
-
-| Python | Executor | Workers | Wall (s, median) | ± | CPU (s) | Peak RSS parent (MiB) | Merge (s) | Speedup |
-|---|---|---|---|---|---|---|---|---|
-| 3.13 (GIL on) | serial | 1 | 1.78 | 0.11 | 1.75 | 81 | 0.23 | 1.00× |
-| 3.13 (GIL on) | threads | 1 | 1.70 | 0.28 | 1.68 | 88 | 0.27 | 1.04× |
-| 3.13 (GIL on) | threads | 2 | 1.74 | 0.12 | 1.74 | 92 | 0.30 | 1.02× |
-| 3.13 (GIL on) | threads | 4 | 1.73 | 0.14 | 1.73 | 101 | 0.27 | 1.03× |
-| 3.13 (GIL on) | threads | 8 | 1.81 | 0.06 | 1.82 | 109 | 0.28 | 0.99× |
-| 3.13 (GIL on) | processes | 1 | 1.76 | 0.10 | 1.80 | 96 | 0.20 | 1.01× |
-| 3.13 (GIL on) | processes | 2 | **1.20** | 0.09 | 1.89 | 98 | 0.20 | **1.48×** |
-| 3.13 (GIL on) | processes | 4 | 1.30 | 0.25 | 2.21 | 102 | 0.23 | 1.37× |
-| 3.13 (GIL on) | processes | 8 | 1.53 | 0.06 | 2.66 | 107 | 0.25 | 1.17× |
-| 3.13t (GIL off) | serial | 1 | 2.22 | 0.14 | 2.21 | 88 | 0.34 | 0.80× |
-| 3.13t (GIL off) | threads | 1 | 2.31 | 0.49 | 2.31 | 94 | 0.36 | 0.77× |
-| 3.13t (GIL off) | threads | 2 | 1.86 | 0.09 | 2.78 | 98 | 0.42 | 0.96× |
-| 3.13t (GIL off) | threads | 4 | 1.86 | 0.13 | 2.78 | 114 | 0.45 | 0.96× |
-| 3.13t (GIL off) | threads | 8 | 1.90 | 0.19 | 2.86 | 127 | 0.47 | 0.94× |
-
-![speedup](docs/lab05_speedup.png)
-
-`sys._is_gil_enabled()` у прогонах на 3.13t повертає `False` (колонка «GIL off» береться саме з нього; `lab05_run.py` записує це значення в кожен рядок JSON).
-
-Оскільки процеси виграють, `findex index` типово запускається з `--executor processes --workers <cpu_count>`.
-
-## Гонитва на 3.13t (`scripts/lab05_race.py`)
-
-Наш `build_partial` нічого спільного між потоками не змінює: кожен шматок має власні словники, а батьківський процес лише склеює результати. Тому в самому індексаторі гонитви немає. Щоб побачити, що саме приховував GIL, скрипт робить «наївну» паралельну статистику: 4 потоки рахують токени в **один спільний `Counter`** через `shared[tok] += 1`.
-
-```
-Python 3.13.18, GIL enabled: True
-naive shared Counter #1: 1,809,580 / 1,809,580 (lost 0), 0.31 s
-fix 1, Lock around +=:       1,809,580 (lost 0), 0.57 s
-fix 2, per-thread Counter:   1,809,580 (lost 0), 0.21 s
----
-Python 3.13.14, GIL enabled: False
-naive shared Counter #1: 1,796,859 / 1,809,580 (lost 12,721), 0.71 s
-naive shared Counter #2: 1,795,395 / 1,809,580 (lost 14,185), 0.68 s
-naive shared Counter #3: 1,794,863 / 1,809,580 (lost 14,717), 0.73 s
-fix 1, Lock around +=:       1,809,580 (lost 0), 1.60 s
-fix 2, per-thread Counter:   1,809,580 (lost 0), 0.13 s
-```
-
-`shared[tok] += 1` — це три кроки: прочитати значення, додати 1, записати. Якщо два потоки одночасно прочитали те саме значення, один із записів губиться. Під GIL такий збіг майже неможливий, бо потік зазвичай не перемикається посеред цих кроків, і на трьох прогонах втрат 0. Але код від цього не стає коректним: GIL захищає внутрішній стан інтерпретатора, а не наш інваріант «сума = кількість токенів». Без GIL потоки справді виконуються одночасно, і губиться ~13–15 тис. оновлень (0,8 %) щоразу по-різному.
-
-Виправлення: (1) `Lock` навколо `+=` — коректно, але на 3.13t у 2,3 раза повільніше за наївний варіант, бо потоки стоять у черзі за замком; (2) **прибрати спільний стан**: у кожного потоку свій `Counter`, а в кінці вони зливаються. Це коректно і найшвидше; саме так працюють `build_partial` і `merge`.
-
-## Чому так вийшло (своїми словами)
-
-**Потоки під GIL не прискорили індексацію.** Індексація — це робота Python-коду на процесорі: regex, `casefold`, оновлення словників. Щоб виконувати байткод, потік мусить тримати GIL, а тримати його може лише один потік. Тому 2, 4 чи 8 потоків по черзі передають один одного GIL і виконують ту саму роботу на одному ядрі: wall ≈ CPU ≈ serial (1,7–1,8 с), а з 8 потоками трохи гірше через перемикання. Потоки допомагають там, де під час очікування GIL відпускається: читання з диска, мережа, `time.sleep` (Лаба 6).
-
-**Процеси прискорили, але не вдвічі, і за це заплачено.** У кожного процесу свій інтерпретатор і свій GIL, тож на 2 ядрах два воркери справді працюють одночасно: wall 1,78 → 1,20 с (1,48×). Чим заплачено:
-- **CPU time > wall**: 1,89 с CPU за 1,20 с wall. Додатковий час іде на запуск інтерпретаторів через spawn (кожен заново імпортує `findex`), на pickle аргументів і результатів, на розпаковування в батьківському процесі.
-- **Більше воркерів, ніж ядер, — гірше**: 4 і 8 процесів на 2 ядрах не мають додаткових ядер, а запуск і pickle кожного процесу коштує. CPU росте до 2,66 с, а wall погіршується до 1,53 с.
-- **RSS**: пік батьківського процесу 81 → 98–107 MiB, бо він тримає розпаковані часткові індекси й готовий індекс водночас. До того ж кожен воркер має власну копію інтерпретатора і своїх даних; цю пам'ять колонка RSS батьківського процесу не показує, але вона теж витрачена.
-
-**Закон Амдала в merge.** `merge` послідовний: 0,20–0,25 с із ~1,78 с, тобто ~13 % (сюди ж входить створення 331 тис. об'єктів `Posting`). Навіть з нескінченною кількістю ядер прискорення не перевищить 1 / 0,13 ≈ **7,7×**. Реальна стеля нижча: сюди ж додаються послідовний `list_sources`, запуск пулу і розпаковування результатів у батьківському процесі. На 2 ядрах ідеал — 2×, отримали 1,48×; різницю з'їли ці послідовні частини.
-
-**Що змінилось на 3.13t.** `sys._is_gil_enabled() == False`, і потоки справді працюють паралельно: CPU 2,78 с за wall 1,86 с, тобто два ядра зайняті одночасно (під GIL CPU завжди ≈ wall). Відносно власного serial на 3.13t потоки дали 2,22 → 1,86 с (1,19×). Проте сама free-threaded збірка поки що повільніша в одному потоці (~25 % на serial: 2,22 проти 1,78 с), бо атомарні лічильники посилань і блокування на рівні об'єктів мають свою ціну. Ще частину виграшу з'їдає конкуренція потоків за спільні об'єкти (регулярний вираз, інтерновані рядки, алокатор). Тому на нашій машині з 2 ядрами потоки 3.13t так і не обігнали serial зі звичайним GIL, а процеси лишились найкращим варіантом. Зате без GIL з'явилась справжня гонитва (див. вище): код, який роками «працював» під GIL, на 3.13t рахує неправильно.
-
-**Протилежний дослід** (ввід-вивід, де потоки масштабуються) я не робив: він необов'язковий, а корпус на 15 МБ повністю лежить у кеші ОС, тож читання файлів тут не впирається в диск. Мережевий варіант того самого буде в Лабі 6 (async-краулер).
-
-### Як відтворити 3.13t
-
-```bash
-uv python install 3.13t
-uv venv .venv-ft -p 3.13t && uv pip install --python .venv-ft/bin/python -e .
-.venv-ft/bin/python -c "import sys; print(sys._is_gil_enabled())"   # False
-.venv-ft/bin/python scripts/lab05_race.py data/
-```
-
----
-
-# Лабораторна 6 — асинхронний краулер
-
-## Що зроблено
-
-```
-src/findex/crawler/
-  urls.py     # canonicalize(): схема й хост у нижньому регістрі, без #фрагмента, без порту за замовчуванням,
-              #   порожній шлях -> "/", без кінцевого "/", відсортований query
-  robots.py   # RobotsCache: robots.txt один раз на хост (asyncio.Lock на хост), 404 -> усе можна,
-              #   401/403/5xx/помилка мережі -> нічого не можна
-  fetch.py    # fetch(): asyncio.timeout; повтор лише 429/5xx/таймаут/помилка з'єднання, щонайбільше 3 рази;
-              #   backoff = min(cap, 0.5*2^n) + U(0, 0.5); Retry-After (секунди або HTTP-дата); інші 4xx — без повторів;
-              #   зациклені редіректи (max 5) -> помилка без повтору
-  crawl.py    # crawl(): async-генератор; asyncio.Queue (frontier) + N воркерів у TaskGroup;
-              #   глобальний Semaphore + Semaphore на хост + мінімальна пауза між запитами до хоста;
-              #   seen-множина канонічних URL; allowlist доменів; selectolax для title/text/links
-  runner.py   # crawl_to_jsonl(): кожна сторінка одразу записується рядком JSONL (з flush), нічого не буферизується
-src/findex/cli.py        # findex crawl ... (живий екран rich, crawl.log, --debug)
-tests/test_crawler.py    # 24 тести на httpx.MockTransport, без мережі
-scripts/make_mirror.py, scripts/mirror_server.py      # локальне дзеркало (див. «Дозвіл»)
-scripts/lab06_bench.py, lab06_run.py                  # таблиця нижче
-scripts/lab06_blocking_demo.py                        # як НЕ треба: індексація всередині корутини
-```
-
-```bash
-findex crawl https://docs.python.org/3/ --max-pages 500 --concurrency 10 --per-host 2 --delay 0.5 \
-    --out data/crawl.jsonl --log crawl.log [--debug]
-findex index data/ --out index.bin       # data/crawl.jsonl читає iter_documents з Лаби 1 — поза циклом подій
-```
-
-**Як влаштовано.** `crawl()` — це `async def` з `yield`: сторінки віддаються одразу, як тільки прийшли. Воркери живуть у `TaskGroup` всередині фонової задачі `run()`; на неї тримається посилання, бо задачі без посилання збирач сміття може знищити. Сторінки з воркерів ідуть у вихідну чергу, а генератор віддає їх споживачу; так не потрібно робити `yield` усередині `TaskGroup`. Коли досягнуто `max_pages` (або frontier спорожнів), усі воркери скасовуються (`CancelledError` у їхньому поточному `await`), `TaskGroup` чисто завершується, а `async with httpx.AsyncClient` закриває пул з'єднань. Клієнт **один** на весь обхід, тож з'єднання перевикористовуються.
-
-**Живий екран** (rich, stderr): зібрано сторінок / max, сторінок за секунду, запитів у дорозі (`in flight`), глибина черги, помилки, повтори, пропуски через robots.txt. У `crawl.log` записується рядок на кожен URL: статус, байти, мс, номер спроби, помилка.
-
-## Дозвіл на обхід
-
-Мережа в середовищі, де я робив лабу, пропускає лише реєстри пакетів і GitHub, тому живі сайти були недоступні. Тому обхід ішов по **локальному дзеркалу** (варіант, який лаба дозволяє прямо):
-
-- `scripts/make_mirror.py` перетворює корпус з Лаби 1 (вихідні `.rst` документації Python з репозиторію CPython, ліцензія PSF/BSD) на 560 HTML-сторінок. Посилання беруться з `toctree`, `:doc:` і `:mod:`; ~120 з них ведуть на неіснуючі сторінки, як на справжньому сайті.
-- `scripts/mirror_server.py` — мій власний сервер на `127.0.0.1`. Щоб поводитись як справжній віддалений сайт, він має **затримку мережі** 0,1 с × U(0,5; 1,5) на кожну відповідь, **robots.txt** з `Disallow: /whatsnew/`, **rate limit** (понад 100 запитів за секунду → `429` з `Retry-After: 1`) і редирект `/library` → `/library/`.
-
-Сайт мій, тож дозвіл є, а robots.txt все одно виконується (у кожному прогоні 1 пропуск `/whatsnew/`). User-Agent чесний і має адресу для зв'язку: `findex-crawler/0.6 (student project; +https://github.com/OWNER/findex)`. Стеля — `--max-pages`, а домени обмежені тими, що є серед стартових URL.
-
-Справжній сайт (наприклад, docs.python.org) обходити лише так: спершу прочитати його `robots.txt` (краулер і сам його виконує), далі `--per-host 2 --delay 0.5` і `--max-pages` не більше 500.
-
-## Бенчмарк: concurrency 1 / 5 / 20
-
-Один початковий URL (`/contents.html`), `max_pages = 300`. Кожна конфігурація — 3 прогони, у таблиці медіана; кожен прогін — свіжий процес краулера і свіжий сервер (rate limiter з нуля). Пік RSS — `ru_maxrss` процесу краулера.
-
-| Concurrency | Per host | Delay (s) | Pages | Wall (s, median) | Pages/s | Errors | Retries | Peak RSS (MiB) |
-|---|---|---|---|---|---|---|---|---|
-| 1 | 1 | 0.0 | 300 | 33.96 | 8.8 | 18 | 0 | 45 |
-| 5 | 5 | 0.0 | 300 | 6.72 | 44.6 | 18 | 0 | 45 |
-| 20 | 20 | 0.0 | 300 | **3.81** | **78.7** | 36 | 26 | 45 |
-| 20 | 2 | 0.0 | 300 | 16.72 | 17.9 | 18 | 0 | 43 |
-| 20 | 4 | 0.05 | 300 | 16.48 | 18.2 | 18 | 0 | 44 |
-
-«Errors» — усе 404 (биті посилання дзеркала). При concurrency 20 до 300-ї сторінки краулер встигає поставити в чергу й перевірити більше посилань, тому 404 вдвічі більше. Сторінок не загублено: усі 300 зібрано в кожному рядку. «Retries» — повтори після 429.
-
-**Чому 20 запитів в одному потоці швидші за підхід Лаби 5.** Цю роботу обмежує **очікування**: ~0,1 с мережевої затримки на сторінку проти ~1–3 мс CPU на розбір HTML. При concurrency 1 краулер 34 с просто чекає (8,8 стор./с ≈ 1 / 0,11 с). Корутина на `await client.get()` віддає керування циклу подій, і поки 20 запитів «у дорозі», ядро вільне для розбору відповідей, тому виходить 8,8 → 44,6 → 78,7 стор./с у **одному потоці** на одному ядрі, а RSS не росте (45 MiB). У Лабі 5 була протилежна робота, обмежена CPU: там чекати нічого, тож користь давали лише інші ядра (процеси), а потоки й корутини не допомагали. Тут навпаки, процеси нічого не дали б: процес на кожен запит — це spawn і pickle заради того, щоб ще й чекати. Потоки впоралися б, але 20 потоків — це 20 стеків ОС і перемикання ядром, а корутина — кілька КБ і перемикання лише на `await`, коли потік і так чекав би.
-
-Чому не 20× від concurrency 1: при 78 стор./с цикл подій уже зайнятий розбором HTML, логуванням, записом JSONL і оновленням екрана, тобто впирається в CPU одного ядра. Крім того, сервер обмежує 100 запитів/с і відповідає 429.
-
-**Чого коштує ліміт на хост і навіщо він лишився.** Усе дзеркало — **один хост**, тож `--per-host` насправді обмежує паралелізм: з `--per-host 2` навіть при concurrency 20 вийшло 16,7 с замість 3,8, тобто у **4,4 раза повільніше**, приблизно як concurrency 2. Зате без цього ліміту сервер почав відповідати **429** (26 повторів на прогін), і краулер втрачав час на очікування `Retry-After`. Для свого дзеркала 20 запитів на хост ок; на чужому сайті це вже навантаження, від якого адміністратор захищається rate limit-ом чи баном. Тому ліміт на хост лишився, а типові значення CLI — `--per-host 2`; для чужих сайтів ще й `--delay`. Глобальний семафор обмежує нашу сторону (файлові дескриптори, пам'ять), семафор на хост захищає їхню. У реальному обході багатьох хостів одне не заважає іншому: 20 запитів розходяться по різних серверах, по 2 на кожен.
-
-## Оброблений збій: 429 + Retry-After
-
-З `crawl.log` прогону concurrency 20 / per-host 20. Сервер віддав 429 з `Retry-After: 1`, `fetch` прочекав рівно стільки (а не свій backoff), повторив, і сторінка прийшла з другої спроби:
-
-```
-2026-11-07 18:45:10,513 WARNING findex.crawler.fetch: retry 1/3 http://127.0.0.1:8799/c-api/frame.html after HTTP 429, sleeping 1.00s
-2026-11-07 18:45:10,527 WARNING findex.crawler.fetch: retry 1/3 http://127.0.0.1:8799/c-api/gen.html after HTTP 429, sleeping 1.00s
-2026-11-07 18:45:10,533 WARNING findex.crawler.fetch: retry 1/3 http://127.0.0.1:8799/c-api/method.html after HTTP 429, sleeping 1.00s
-...
-2026-11-07 18:45:11,589 INFO findex.crawler.crawl: http://127.0.0.1:8799/c-api/frame.html 200 8003B 1201ms try=2
-```
-
-Поки ці воркери спали в `await sleep(1.0)` (`asyncio.sleep` віддає керування), решта продовжувала обхід. За трьома прогонами жоден 429 не дійшов до межі в 3 повтори. Інші збої покривають тести: таймаут повторюється 3 рази і записується як `timeout after …s`; зациклені редіректи `/a → /b → /a` дають помилку `too many redirects (loop?)` без повторів; 404 не повторюється.
-
-## Цикл подій не блокується (`--debug`)
-
-`findex crawl ... --concurrency 20 --per-host 20 --max-pages 300 --debug` вмикає `asyncio.run(..., debug=True)`, який повідомляє про будь-який крок, що тримає цикл понад 100 мс. Попередження логера `asyncio` теж пишуться в `crawl.log`. Результат: **0 попереджень** (300 сторінок за 2,5 с). Розбір HTML через selectolax (C) займає ~1 мс на сторінку, а індексація відбувається поза циклом, окремою командою `findex index`.
-
-**Де цикл зупинився б, якби індексувати всередині корутини** (`scripts/lab06_blocking_demo.py`: кожні 50 сторінок перебудовувати індекс прямо в `async for`):
-
-```
-50 pages -> Index(terms=7_674, docs=50, positions=False)
-WARNING asyncio: Executing <Task pending name='Task-1' coro=<main() ...> took 0.135 seconds
-100 pages -> ...                                            ... took 0.391 seconds
-150 pages -> ...                                            ... took 0.438 seconds
-200 pages -> ...                                            ... took 0.574 seconds
-```
-
-`build_index` — це чистий CPU без жодного `await`, тож на 0,1–0,6 с (і що далі, то довше) зупиняються **всі** 20 воркерів: відповіді вже лежать у сокетах, але їх ніхто не читає, таймаути спливають, а лічильник пауз на хост «з'їдає» час. Тому краулер лише пише JSONL, а індекс будує `findex index` уже після обходу (у Лабі 5 — на процесах). Якби індексувати треба було під час обходу, CPU-роботу варто віддати в `loop.run_in_executor(ProcessPoolExecutor, ...)`.
-
-Тести: 98 (усі зелені), pyright strict — 0 помилок. Покриття впало з 97 до **92 %**: команду `findex crawl` (живий екран rich, `asyncio.run`) я перевіряв вручну на дзеркалі, а не в pytest. Логіку під нею (`crawl_to_jsonl`, `crawl`, `fetch`, `RobotsCache`) покривають тести на `MockTransport`.
-
----
-
-# Лабораторна 7 — пошук у вебі (FastAPI)
-
-## Що зроблено
-
-```
-src/findex/web/
-  settings.py   # Settings(BaseSettings): INDEX_PATH, LOG_LEVEL — лише зі змінних оточення (+ .env локально)
-  models.py     # Pydantic лише на межі: SearchResponse, Hit, DocumentOut, StatsOut, Health
-  app.py        # create_app(): lifespan, Depends(get_index), маршрути, request-id, обробник 500
-  templates/    # Jinja2: base.html, index.html (пошук), doc.html (документ)
-  static/       # style.css
-Dockerfile, .dockerignore, render.yaml
-tests/test_web.py          # TestClient + dependency_overrides, без файлу індексу
-scripts/lab07_variants.py  # копія /search на async def — лише для виміру
-```
-
-| Маршрут | Що робить |
-|---|---|
-| `GET /search?q=&k=&scorer=&page=` | JSON. `q`: 1–200 символів; `k`: 1–50; `scorer`: `bm25`/`tfidf` (`Literal` → enum у схемі); `page`: 1–100. Відповідь: `total`, `pages`, `took_ms`, `results[]` (doc_id, title, score, snippet, url). Неправильний тип чи межа → **422**, зламаний запит → **400** |
-| `GET /docs/{doc_id}` | документ (метадані + текст), невідомий → **404** |
-| `GET /stats` | документи, терміни, постінги, середня довжина, розмір файлу, uptime |
-| `GET /health` | `{"status":"ok","documents":560}` або **503**, якщо індекс не завантажено |
-| `GET /`, `GET /doc/{id}` | HTML-інтерфейс (Jinja2) |
-| `GET /docs` | OpenAPI/Swagger, згенерований з анотацій типів і моделей Pydantic |
-
-- **lifespan** завантажує індекс **один раз** через `open_index(settings.index_path)` з Лаби 3 і кладе його в `app.state.index`. Якщо файлу немає, падає вже **старт** (`FileNotFoundError`), а не перший запит. Після `yield` контекстний менеджер закриває індекс. `get_index` (через `Depends`) лише дістає його зі `state`, тому в тестах `app.dependency_overrides[get_index] = lambda: tiny_index`.
-- **Pydantic лише на межі**: `Hit.from_result(SearchResult)` перетворює внутрішні dataclass-и Лаб 2–3 на моделі відповіді. `Index`, `Posting`, `SearchResult` лишились dataclass-ами.
-- **Помилки**: middleware дає кожному запиту `X-Request-ID` (або бере його з запиту). Неочікуваний виняток пишеться в лог разом зі стеком і id (`request req-42 GET /search failed`), а клієнт отримує лише `{"detail":"internal server error","request_id":"req-42"}` зі статусом 500.
-- **`findex serve [--index] [--host] [--port|$PORT] [--workers N]`** запускає uvicorn, тож вхід у програму, як і раніше, через CLI. Логи uvicorn і `findex` йдуть у stdout, рівень береться з `$LOG_LEVEL`:
-  ```
-  INFO:     loaded Index(terms=42_604, docs=560, positions=True) from index.bin in 0.83 s
-  INFO:     127.0.0.1:46592 - "GET /search?q=(bad HTTP/1.1" 400 Bad Request
-  ```
-- **UI**: поле пошуку з вибором BM25/TF-IDF, підказка синтаксису, кількість збігів і час, сніпети з `<mark>` (спершу HTML-escape, потім `**term**` → `<mark>`), бал, сторінки «← previous / next →», перегляд документа. Шрифт системний, ширина обмежена 760 px. htmx я не додавав (це опційно).
-
-```bash
-findex index data/ --out index.bin --positions
-findex serve --index index.bin                   # http://127.0.0.1:8000/  ·  /docs  ·  /health
-INDEX_PATH=index.bin uvicorn findex.web.app:app  # те саме напряму
-```
-
-**Тести** (`tests/test_web.py`, 18 тестів): успішний пошук і пагінація, сім варіантів **422**, 400 на зламаний запит, **404** документа, `/stats`, **`/health` → 503**, коли індекс не завантажено, lifespan вантажить індекс один раз і звільняє його, відсутній файл валить старт, **500 без стека** з `request_id` (стек лише в лозі), HTML-сторінки, екранування в `highlight`, `/openapi.json` і `/docs`. Разом 117 тестів (2 з них `slow`), покриття 93 %, pyright strict — 0 помилок.
-
-## `def` чи `async def` для `/search`
-
-Пошук — це CPU-робота (~17 мс на `q=python`: обчислення дерева, BM25, читання 10 файлів для сніпетів), і в ній немає жодного `await`. Обидва варіанти виміряно на одному сервері (`scripts/lab07_variants.py`: `/search` — `def`, `/search_async` — `async def` з тим самим тілом). Машина та сама, що в Лабі 5: 2 ядра, Xeon 2,1 ГГц; `oha` працює на тій самій машині.
-
-**20 одночасних запитів** (`oha -n 20 -c 20`, по 3 прогони):
-
-| Варіант | Загалом | p50 | найшвидший | найповільніший |
+| Що | До | Після | Прискорення | Що змінилось |
 |---|---|---|---|---|
-| `def` (пул потоків) | 0,36–0,43 с | 313–354 мс | 115–313 мс | 356–432 мс |
-| `async def` | 0,35 с | 220–233 мс | 51–197 мс | 345–354 мс |
+| завантаження `index.bin` | 890 мс | **18 мс** | **49×** | постінги — NumPy CSR-масиви; `Posting` створюються ліниво |
+| пошук `python async queue` (від запиту до сніпетів) | 76 мс | **25 мс** | 3,0× | сніпети: один `re.finditer` по термінах замість повної токенізації; `str.replace` замість `str.translate` (ще один гарячий рядок, знайдений лише в профілі «після») |
+| збірка індексу (serial, з позиціями) | 2,73 с | **1,71 с** | 1,6× | `merge` пише одразу в масиви; `str.replace` у токенізаторі |
 
-Загальний час однаковий (~0,35 с ≈ 20 × 17 мс): робота однієї природи, і GIL у будь-якому разі виконує її по черзі. Відрізняється **розподіл**. `async def` обробляє запити строго один за одним на циклі подій: перші відповіді приходять швидко, останні — повільно. `def` віддає їх у пул потоків, і там вони чергуються під GIL: усі завершуються «разом» і пізніше, але жоден не блокує цикл.
+Після правок перше місце в профілі пошуку все одно займає `snippet` (~2,5 мс на документ): це вже регулярний вираз у C по сторінках на 100–300 КБ. Наступний крок — зберігати зсуви входжень в індексі, щоб не читати файли.
 
-**Що відчувають сторонні запити.** Під навантаженням на `/search` (20 клієнтів) окремо міряємо `/health` (40 запитів підряд):
+### 2. NumPy-скорер
 
-| Навантаження на | `/health` p50 | p95 | p99 / max |
-|---|---|---|---|
-| `def /search` | 17–18 мс | 102–119 мс | 114–134 мс |
-| `async def /search` | 0,4–0,6 мс | 391–413 мс | 406–414 мс |
+Постінги зберігаються в **CSR-розкладці** (`src/findex/arrays.py`): `doc_ids: int32[P]`, `tfs: int32[P]`, `offsets: int64[T+1]`, позиції — окремий `int32` масив; довжини документів — один `int32` масив `doc_len_array`. Для терміна береться **зріз-view**, без копії. BM25 для всіх документів терміна — це один вираз:
 
-З `async def` цикл подій зайнятий пошуком, і `/health` чекає, поки виконається вся черга (~20 × 17 мс ≈ 400 мс). На платформі такий health-check може дати таймаут, і сервіс перезапустять. З `def` цикл вільний, і `/health` відповідає в межах ~0,1 с: затримка лише від того, що він ділить GIL з потоками пулу. **Тому в коді лишився `def /search`**, а маршрут `/health`, який нічого не блокує, тепер `async def`. Спершу він теж був `def` і стояв у тій самій черзі пулу потоків, що й пошук; вимір це показав.
-
-## Навантаження: oha
-
-`oha -z 15s -c 50 "…/search?q=python"`, індекс з позиціями, 560 документів:
-
-| Ціль | Маршрут | Concurrency | RPS | p50 (ms) | p95 (ms) | p99 (ms) |
-|---|---|---|---|---|---|---|
-| local, 1 worker, `async def` | `/search_async` | 50 | 62.3 | 806 | 881 | 2704 |
-| local, 1 worker, `def` | `/search` | 50 | 53.0 | 955 | 1349 | 1867 |
-| local, 4 workers, `def` | `/search` | 50 | **117.7** | **413** | **698** | **820** |
-| deployed (Render free) | `/search` | 20 | _заповнити_ | | | |
-
-**Як це пов'язано з Лабами 5–6.** Один процес упирається в **GIL** (Лаба 5): пошук — це Python-код на CPU, тож і `async def`, і пул потоків виконують його по одному запиту за раз, звідси стеля ~55–60 RPS ≈ 1 / 17 мс. `async def` дав навіть трохи більше RPS (немає перемикань між потоками), але це **заблокований цикл подій** з Лаби 6. Запити обробляються в порядку прийняття, хтось потрапляє в кінець черги, і p99 = 2,7 с (у 3,4 раза гірше за p50). **Пул потоків** (`def`) не додає паралелізму, бо GIL той самий, зате цикл подій вільний і черга «чесніша»: p99 1,9 с, і сторонні запити (`/health`) не застрягають. Реально помогли **кілька процесів**: 4 воркери uvicorn — це 4 інтерпретатори з власними GIL, тож на 2 ядрах RPS зріс у 2,2 раза, а p99 впав до 0,8 с. Більше ніж 2× тут не отримати: ядер лише 2, і ще одне ділить `oha`. Це те саме, що `ProcessPoolExecutor` у Лабі 5, тільки процеси тримає uvicorn.
-
-## Docker і деплой
-
-**Dockerfile** — два етапи за [uv Docker guide](https://docs.astral.sh/uv/guides/integration/docker/):
-1. `builder` (`ghcr.io/astral-sh/uv:python3.13-bookworm-slim`): спершу лише залежності за `uv.lock` (`uv sync --locked --no-dev --no-install-project`, окремий шар кешу), потім сам пакет (`--no-editable`). Там же завантажується корпус (`scripts/get_corpus.sh`) і будується індекс; для демо вони «запечені» в образ.
-2. runtime (`python:3.13-slim-bookworm`): лише `.venv`, `data/` та `index.bin`, користувач **`app` (uid 10001), не root**. Конфіг лише з оточення: `INDEX_PATH`, `LOG_LEVEL`, `PORT`, `WEB_CONCURRENCY`. Є `HEALTHCHECK` на `/health`.
-
-```bash
-docker build -t findex .
-docker run --rm -p 8000:8000 -e INDEX_PATH=/app/index.bin findex     # http://localhost:8000/
+```python
+dl = index.doc_len_array[doc_ids]  # fancy indexing
+norm = k1 * (1 - b + b * dl / avg_len)
+scores[doc_ids] += idf * tfs * (k1 + 1) / (tfs + norm)  # ufuncs + scatter-add
+top = np.argpartition(cand, -k)[-k:]  # O(n) замість сортування
 ```
 
-У середовищі, де я робив лабу, не було демона Docker і доступу до реєстрів образів, тож `docker build` я не запускав. Кроки обох етапів я відтворив вручну: `uv sync --locked --no-dev --no-editable` у чистій копії, шаблони й CSS потрапили в пакет, dev-залежностей немає; індекс збудовано; `findex serve --host 0.0.0.0` з `$PORT` віддає `/health` 200, `/` 200, `/static/style.css` 200.
+**Порядок результатів збігається з Лабою 3 до біта.** Формула й порядок операцій ті самі, тож float-и ідентичні. Нічиї розв'язуються так само, як у `heapq.nlargest` Лаби 3 (за зростанням `doc_id`): після `argpartition` беруться всі, хто дорівнює k-му, і сортуються `lexsort`. Перевіряють це тести `tests/test_numpy_scoring.py`: параметризовані запити, **Hypothesis з навмисними нічиїми** і повний корпус (`slow`).
 
-**Render** (безкоштовний план, Docker runtime): `render.yaml` у корені — це Blueprint.
-1. render.com → New → **Blueprint** → вибрати цей репозиторій (або New → Web Service → Docker).
-2. **Health Check Path = `/health`** (уже в `render.yaml`). Render сам задає `$PORT`, змінні оточення — у вкладці Environment, логи — у вкладці **Logs** (там видно `loaded Index(...)` та access-лог).
-3. Публічну адресу вписати на початок README (замість `findex-OWNER.onrender.com`).
-4. Рядок «deployed» для таблиці: `oha -z 30s -c 20 "https://<адреса>/search?q=python"`.
+Скорер окремо (match закешований, без сніпетів; `scripts/lab08_scorer_bench.py`, найкращий із 5×20 запусків):
 
-Безкоштовний інстанс Render засинає без трафіку, і перший запит після паузи йде ~30–60 с (холодний старт плюс завантаження індексу), тож перед `oha` відкрий `/health`. Крім того, там зазвичай лише частка ядра, тож RPS буде нижчий за локальний, а p50 додасть мережа (~50–150 мс).
+| Запит | Збіглося документів | Постінгів | Скорер Лаби 3 (мс) | NumPy (мс) | Прискорення |
+|---|---|---|---|---|---|
+| частий терм `the` | 552 | 552 | 0.650 | 0.051 | **12.7×** |
+| рідкісний терм `winsound` | 5 | 5 | 0.007 | 0.016 | **0.4×** (повільніше) |
+| 3 терми `python OR async OR queue` | 475 | 568 | 0.585 | 0.079 | **7.4×** |
+| 3 терми `python async queue` (AND) | 13 | 568 | 0.056 | 0.064 | 0.9× |
+
+**Де виграш і де ні.** На довгому списку постінгів Python-цикл Лаби 3 робить на кожен постінг виклик методу, два пошуки в словниках і кілька boxed float. NumPy проходить той самий масив одним C-циклом, звідси 12,7×. На **рідкісному** термі (5 постінгів) роботи майже немає, і перемагають накладні витрати: створити `np.zeros(560)`, зробити зрізи, викликати ufunc-и, `argpartition`, `lexsort` — ~15 мкс сталої ціни проти 7 мкс на весь Python-цикл. У запиті **AND** NumPy так само рахує всі 568 постінгів, а Python пропускає ті, яких немає серед 13 збігів (`if doc_id in wanted`), тож роботи в нього менше. Корпус на 560 документів малий для NumPy: на мільйоні документів різниця росла б разом з довжиною списків. У CI тест `test_numpy_scorer_stays_faster_than_lab3` падає, якщо NumPy-скорер на довгому списку стане менш ніж утричі швидшим. `pytest-benchmark` на `search` і `build_index` пише числа в лог CI і в artifact `benchmark.json`.
+
+### 3. Семантичний і гібридний пошук
+
+```bash
+findex embed index.bin --out embeddings.npz                       # 9 338 фрагментів × 300, ~3 с
+findex search index.bin "isolated sandbox with its own installed packages" --mode semantic
+curl "localhost:8000/search?q=...&mode=hybrid"                     # і перемикач на сторінці
+```
+
+- **Фрагменти** по 200 токенів; документ отримує бал свого **найкращого фрагмента**. Фрагменти лежать підряд за документом, тож це сегментний `np.maximum.reduceat`.
+- **Схожість**: усі рядки `E` нормовані, тож `E @ q` — це косинуси всіх 9 338 фрагментів одним матрично-векторним добутком (~1 мс).
+- **Гібрид**: `score(d) = Σ 1/(60 + rank_i(d))` по рейтингу BM25 (глибина 100) і семантичному. Нормалізувати бали не треба.
+- **Модель.** У середовищі, де робилась лаба, Hugging Face був недоступний (мережа пропускає лише PyPI і GitHub), тож `all-MiniLM-L6-v2` завантажити не вдалось. Натомість узяв **попередньо навчені 300-вимірні вектори слів** зі spaCy `en_core_web_md` (реліз на GitHub, ліцензія MIT). `scripts/export_wordvec.py` експортує їх у `models/wordvec.npz` (7,7 МБ, 302 тис. слів), тож під час роботи потрібен лише NumPy. Ембединг тексту — це IDF-зважене середнє векторів слів плюс постобробка SIF: віднімаються середній вектор корпусу і перша головна компонента. Без SIF усі тексти мали косинус ~0,82 між собою. Це слабша модель, ніж трансформер, бо порядку слів вона не бачить, і таблиця нижче це показує.
+
+**precision@5** (`scripts/lab08_eval.py`): 10 запитів Лаби 3 з тією самою розміткою плюс **5 перефразованих**. Їх я розмітив до запуску, і в них свідомо немає ключових слів релевантних сторінок (назв модулів, слів із заголовків). «max» — найкраще досяжне P@5, коли релевантних документів менше п'яти.
+
+| Запит | вид | max | keyword (BM25) | semantic | hybrid (RRF) |
+|---|---|---|---|---|---|
+| `"event loop"` | оригінал | 1.0 | 1.0 | 0.4 | 0.6 |
+| `"regular expression"` | оригінал | 0.4 | 0.4 | 0.2 | 0.4 |
+| `unicode normalization` | оригінал | 0.4 | 0.4 | 0.0 | 0.2 |
+| `"garbage collector"` | оригінал | 0.8 | 0.6 | 0.4 | 0.4 |
+| `"context manager"` | оригінал | 0.6 | 0.2 | 0.4 | 0.2 |
+| `thread lock` | оригінал | 0.6 | 0.4 | 0.2 | 0.4 |
+| `json decode` | оригінал | 0.2 | 0.2 | 0.2 | 0.2 |
+| `pickle unpickling security` | оригінал | 0.8 | 0.2 | 0.6 | 0.4 |
+| `decorator wraps` | оригінал | 0.2 | 0.2 | 0.0 | 0.2 |
+| `"virtual environment"` | оригінал | 0.8 | 0.6 | 0.8 | 0.8 |
+| `run many jobs at once on all cores` | перефраз | 1.0 | 0.2 | 0.2 | 0.2 |
+| `turn objects into bytes and restore them later` | перефраз | 1.0 | 0.0 | 0.2 | 0.0 |
+| `spot textual patterns with wildcards` | перефраз | 0.8 | 0.0 | 0.0 | 0.0 |
+| `isolated sandbox with its own installed packages` | перефраз | 0.8 | 0.0 | 0.4 | 0.4 |
+| `wait for many network operations without stalling` | перефраз | 1.0 | 0.0 | 0.0 | 0.0 |
+| **середнє, 10 оригінальних** | | 0.58 | **0.42** | 0.32 | 0.38 |
+| **середнє, 5 перефразованих** | | 0.92 | 0.04 | **0.16** | 0.12 |
+| **середнє, усі 15** | | 0.69 | 0.29 | 0.27 | 0.29 |
+
+**Що з цього видно.** На запитах тими самими словами, що й у документах, виграє **BM25** (0,42): точні терміни, назви модулів, фрази на кшталт `"event loop"`, де семантика розмиває. На **перефразованих** BM25 майже нуль (0,04): неявний AND вимагає всіх слів, і знаходяться випадкові довгі сторінки, де вони просто трапляються. Семантика вчетверо краща (0,16), бо знаходить `pickle.rst` на «turn objects into bytes» і `venv` на «isolated sandbox», не маючи спільних ключових слів. Вона ж виграла на двох оригінальних запитах (`"context manager"`, `pickle … security`), де BM25 тягнув сторінки з купою згадок. **Гібрид** ніде не найгірший і в середньому дорівнює BM25 (0,29), але й ніде не найкращий: RRF рахує обидва рейтинги рівноправними, і слабкий рейтинг тягне сильний донизу. Головне обмеження — модель. Середнє векторів слів не бачить порядку й контексту («restore» поруч із «objects» для неї те саме, що й деінде), тож на перефразах 0,16 проти стелі 0,92. Справжній sentence-transformer (MiniLM) якраз для цього навчений, і заміна моделі — перший крок далі: `Embedder` ізольований в одному класі. Розмітка моя, а 15 запитів — мала й шумна вибірка: різниця в 0,04 тут нічого не означає, а 0,04 → 0,16 на перефразах — означає.
+
+### 4. Навантаження після Лаби 8
+
+`oha -z 15s "…/search?q=python"`, та сама машина (2 ядра), що й у Лабі 7:
+
+| Ціль | Concurrency | RPS | p50 (мс) | p95 (мс) | p99 (мс) |
+|---|---|---|---|---|---|
+| Лаба 7: 1 воркер, `def` | 50 | 53.0 | 955 | 1349 | 1867 |
+| **Лаба 8: 1 воркер, `def`** | 50 | **98.1** | 517 | 682 | 830 |
+| Лаба 7: 4 воркери | 50 | 117.7 | 413 | 698 | 820 |
+| **Лаба 8: 4 воркери** | 50 | **231.9** | 213 | 479 | 600 |
+| Лаба 8: 4 воркери | 10 | 228.2 | 36 | **95** | 121 |
+| Лаба 8: 4 воркери, `mode=hybrid` (`turn objects into bytes`) | 10 | 55.3 | 176 | 256 | 327 |
+| deployed (Render free) | 20 | _заповнити після деплою v1.0.0_ | | | |
+
+Пропускна здатність подвоїлась, бо швидшими стали сніпети, а не BM25. Гібрид повільніший: на кожен запит два рейтинги і сніпети для слів, що трапляються в сотнях документів.
+
+---
+
+## Зведені виміри: Лаби 1–8
+
+**Лаба 1 — генератори проти списків** (повний корпус, `tracemalloc`):
+
+| Версія | Пік пам'яті | Час |
+|---|---|---|
+| eager (списки) | 109,3 MiB | 6,99 с |
+| lazy (генератори) | **6,8 MiB** | 6,72 с |
+
+**Лаба 2 — представлення постінгів** (331 826 постінгів):
+
+| Представлення | Пік (збірка) | Утримано | Файл (pickle) | Завантаження |
+|---|---|---|---|---|
+| `list[Posting]`, звичайний `@dataclass` | 38,7 MiB | 36,6 MiB | 6,5 MiB | 0,17 с |
+| `list[Posting]`, `slots=True` | 26,3 MiB | 23,9 MiB | 5,3 MiB | 0,71 с |
+| пари `array('I')` | **17,6 MiB** | **15,1 MiB** | **4,4 MiB** | **0,04 с** |
+| _Лаба 8: NumPy CSR (+ позиції)_ | | | 12,8 MiB | **0,018 с** |
+
+**Лаба 2 — merge проти set і формати збереження:** на двох довгих списках set швидший у ~3 рази (48 проти 18 мкс, AND), коли один зі списків короткий — швидший merge (0,1 проти 4,4 мкс). JSON без позицій менший (3,3 проти 5,6 MiB) і швидше вантажиться (0,49 проти 0,94 с), ніж pickle об'єктів `Posting`.
+
+**Лаба 3 — рейтинг:** 20-те входження додає до BM25 0,9 % від першого (до TF-IDF — стільки ж, скільки перше); короткий документ (26 токенів) отримує в BM25 у 4,8 раза вищий бал, ніж довгий (15 052). P@5 на 10 запитах: TF-IDF **0,34**, BM25 **0,42**.
+
+**Лаба 4 — якість:** pyright strict 0 помилок; покриття 97 % → (Лаба 8) **93 %**, 184 тести; CI: ruff, pyright, pytest, benchmarks, wheel.
+
+**Лаба 5 — паралельна збірка** (2 ядра; медіана з 3; serial = 1,78 с):
+
+| Виконавець | Воркери | Wall (с) | CPU (с) | Прискорення |
+|---|---|---|---|---|
+| threads (GIL) | 2 / 4 / 8 | 1,74 / 1,73 / 1,81 | ≈ wall | ~1,0× |
+| **processes** | **2** | **1,20** | 1,89 | **1,48×** |
+| processes | 8 | 1,53 | 2,66 | 1,17× |
+| threads, 3.13t (без GIL) | 2 | 1,86 | 2,78 | 0,96× (serial 3.13t: 2,22 с) |
+
+Гонитва на 3.13t: спільний `Counter` під 4 потоками губив 12–15 тис. оновлень, під GIL — 0.
+
+**Лаба 6 — краулер** (300 сторінок, локальне дзеркало з затримкою ~0,1 с):
+
+| Concurrency | Per host | Wall (с) | Сторінок/с | Повтори 429 |
+|---|---|---|---|---|
+| 1 | 1 | 33,96 | 8,8 | 0 |
+| 5 | 5 | 6,72 | 44,6 | 0 |
+| **20** | 20 | **3,81** | **78,7** | 26 |
+| 20 | 2 | 16,72 | 17,9 | 0 |
+
+**Лаба 7 — `def` проти `async def`:** однакова пропускна здатність (GIL), але під `async def /search` p99 сторонній `/health` — ~410 мс проти ~130 мс з `def`. Таблиця `oha` — у розділі 4 вище.
+
+**Лаба 8:** див. розділи 1–4 вище.
+
+---
+
+## Обмеження (чесно)
+
+- **Корпус малий**: 560 документів / 15 МБ. На такому розмірі NumPy і процеси дають скромний виграш, а виміри зроблено на машині з 2 ядрами.
+- **Семантика — на векторах слів**, а не на трансформері (MiniLM був недоступний): на перефразах P@5 лише 0,16. Гібрид за якістю дорівнює BM25.
+- **Краулер обходив локальне дзеркало**, а не живий сайт (з середовища розробки зовнішні сайти були недоступні). Код той самий, `robots.txt` і ліміти виконуються.
+- **Сніпети перечитують файли з диска** при кожному пошуку, тож для сторінок із краулера (в індексі лише URL) сніпета й тексту документа немає.
+- **pickle** — лише для власних файлів індексу (див. Лабу 2); індекс повністю в пам'яті, без `mmap`; оновлення індексу — тільки повна перебудова.
+- **Неявний AND** у keyword-режимі: довгі природні запити краще шукати в `hybrid` чи `semantic`.
+- Безкоштовний Render засинає без трафіку: перший запит після паузи йде ~30–60 с.
+
+## Демо-відео
+
+🎬 [2–3 хвилини](VIDEO_URL): (1) пошук на живій адресі з фразою й `NOT`; (2) той самий перефразований запит у `keyword` і `hybrid`; (3) `/docs` і `/health`; (4) flame graph «до/після» і таблиця NumPy; (5) один баг, який чогось навчив: pickle класів з `__main__` у Лабі 2, або гонитва на 3.13t у Лабі 5.
+
+## Ліцензії даних
+
+Корпус — документація CPython (PSF License). Вектори слів — spaCy `en_core_web_md` (MIT).

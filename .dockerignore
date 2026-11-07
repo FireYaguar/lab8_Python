@@ -6,6 +6,7 @@ mirror
 dist
 index*.bin
 index*.json
+embeddings*.npz
 *.jsonl
 crawl.log
 .pytest_cache
