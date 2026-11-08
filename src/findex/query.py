@@ -68,6 +68,8 @@ class Phrase(Node):
     def evaluate(self, index: Index) -> list[int]:
         if not index.has_positions:
             raise QueryError("phrase queries need an index built with --positions")
+        if any(w not in index for w in self.words):
+            return []  # a word of the phrase is not in the corpus at all: no document matches
         candidates = index.doc_ids(self.words[0])
         for w in self.words[1:]:
             candidates = merge_and(candidates, index.doc_ids(w))

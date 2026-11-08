@@ -39,6 +39,12 @@ def test_parse_errors(bad: str) -> None:
         parse(bad)
 
 
+def test_phrase_with_unknown_word_matches_nothing(ix: Index) -> None:
+    # regression: a pasted command with a quoted URL used to raise KeyError -> HTTP 500
+    assert parse('"event zzzunknown"').evaluate(ix) == []
+    assert parse('python "https://example.onrender.com/search?q=x"').evaluate(ix) == []
+
+
 def test_phrase_needs_adjacent_positions(ix: Index) -> None:
     assert parse('"event loop"').evaluate(ix) == [0]  # doc 1 has "loop event"
     assert parse("event loop").evaluate(ix) == [0, 1]
