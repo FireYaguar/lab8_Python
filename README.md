@@ -4,7 +4,7 @@
 
 **Повнотекстовий і семантичний пошук по документації Python, побудований з нуля за 8 лабораторних: від генератора, що читає файли, до задеплоєного FastAPI-сервісу.**
 
-**🔎 Live: https://findex-OWNER.onrender.com** · API: [`/docs`](https://findex-OWNER.onrender.com/docs) · [`/health`](https://findex-OWNER.onrender.com/health) · 🎬 [демо-відео (2–3 хв)](VIDEO_URL)
+**🔎 Live: https://findex-OWNER.onrender.com** · API: [`/docs`](https://findex-OWNER.onrender.com/docs) · [`/health`](https://findex-OWNER.onrender.com/health) · 🎬 [демо-відео (2:18)](docs/demo.mp4)
 
 ![пошук у findex](docs/demo.gif)
 
@@ -197,7 +197,7 @@ curl "localhost:8000/search?q=...&mode=hybrid"                     # і пере
 
 **Лаба 3 — рейтинг:** 20-те входження додає до BM25 0,9 % від першого (до TF-IDF — стільки ж, скільки перше); короткий документ (26 токенів) отримує в BM25 у 4,8 раза вищий бал, ніж довгий (15 052). P@5 на 10 запитах: TF-IDF **0,34**, BM25 **0,42**.
 
-**Лаба 4 — якість:** pyright strict 0 помилок; покриття 97 % → (Лаба 8) **93 %**, 184 тести; CI: ruff, pyright, pytest, benchmarks, wheel.
+**Лаба 4 — якість:** pyright strict 0 помилок; покриття 97 % → (Лаба 8) **93 %**, 184 тести; CI: ruff, pyright, pytest, benchmarks, wheel; релізи з wheel для тегів `v*` створює `release.yml` автоматично.
 
 **Лаба 5 — паралельна збірка** (2 ядра; медіана з 3; serial = 1,78 с):
 
@@ -237,7 +237,7 @@ curl "localhost:8000/search?q=...&mode=hybrid"                     # і пере
 
 ## Демо-відео
 
-🎬 [2–3 хвилини](VIDEO_URL): (1) пошук на живій адресі з фразою й `NOT`; (2) той самий перефразований запит у `keyword` і `hybrid`; (3) `/docs` і `/health`; (4) flame graph «до/після» і таблиця NumPy; (5) один баг, який чогось навчив: pickle класів з `__main__` у Лабі 2, або гонитва на 3.13t у Лабі 5.
+🎬 [docs/demo.mp4](docs/demo.mp4) (2 хв 18 с, без звуку, з підписами на екрані; записано скриптом `scripts/make_demo_video.py`: Playwright керує справжнім сервісом у Chrome). Зміст: (1) пошук у вебінтерфейсі з фразою й `NOT`, сторінки, перегляд документа; (2) той самий перефразований запит у `keyword`, `semantic` і `hybrid`; (3) OpenAPI-схема, JSON від `/search` і `/health`; (4) flame graph «до/після» і таблиця NumPy; (5) один баг, який чогось навчив: гонитва на спільному `Counter` у Python 3.13t (Лаба 5).
 
 ## Ліцензії даних
 

@@ -1,0 +1,38 @@
+name: Release
+
+# Creates a GitHub Release with the wheel for every v* tag that does not have one yet
+# (v0.4.0, v0.7.0, v1.0.0, ...). Runs on push to main, on a new tag, or by hand.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+      - name: Build the wheel of each tag and attach it to a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for tag in $(git tag --list 'v*'); do
+            if gh release view "$tag" > /dev/null 2>&1; then
+              echo "$tag: release exists"; continue
+            fi
+            git worktree add -q "build-$tag" "$tag"
+            (cd "build-$tag" && uv build --wheel -o "../dist-$tag")
+            gh release create "$tag" dist-"$tag"/*.whl --title "$tag" \
+              --notes "findex $tag. Install: uv tool install <URL of the .whl below>, then: findex --help"
+          done
