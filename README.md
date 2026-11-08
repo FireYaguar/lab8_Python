@@ -1,6 +1,6 @@
 # findex
 
-[![CI](https://github.com/OWNER/findex/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/findex/actions/workflows/ci.yml)
+[![CI](https://github.com/FireYaguar/lab8_Python/actions/workflows/ci.yml/badge.svg)](https://github.com/FireYaguar/lab8_Python/actions/workflows/ci.yml)
 
 **Повнотекстовий і семантичний пошук по документації Python, побудований з нуля за 8 лабораторних: від генератора, що читає файли, до задеплоєного FastAPI-сервісу.**
 
